@@ -39,16 +39,22 @@ from matplotlib.backends.qt_compat import QtWidgets
 from matplotlib.figure import Figure
 from matplotlib.ticker import FormatStrFormatter
 
-from astropy.visualization import ImageNormalize, AsinhStretch, LinearStretch
+import astropy.units as u
+from astropy.coordinates import SkyCoord
+from astropy.wcs.utils import wcs_to_celestial_frame
+from astropy.visualization import ImageNormalize, AsinhStretch, LinearStretch, SqrtStretch, LogStretch
 
 import eispac
 
-
+#@window########################################################################
+# MAIN GUI WINDOW ##############################################################
+################################################################################
 class MainWindow(QtWidgets.QWidget):
     def __init__(self, input_filename=None):
         super().__init__()
         self.font_default = QtGui.QFont("Arial", 12)
         self.font_default_italic = QtGui.QFont("Arial", 12, italic=True)
+        self.font_default_bold = QtGui.QFont("Arial", 12, weight=QtGui.QFont.Bold)
         self.font_small = QtGui.QFont("Arial", 10)
         self.font_info = QtGui.QFont("Courier New", 9)
         self.base_width = 85 #75
@@ -59,11 +65,16 @@ class MainWindow(QtWidgets.QWidget):
         ### INIT EMPTY LISTS USED BY THE APPLICATION
         self.all_line_ids = eispac.data.load_chianti_lines(sort='wave')
 
-        # PyQT grids and layouts
+        # PyQT grids, layouts, and key reference indices and parameters
         self.main_grid = None
         self.sub_frame = [None]*self.max_num_rasters
         self.sub_grid = [None]*self.max_num_rasters
         self.curr_layout_ind = None
+        self.lim_dialog = None
+        self.dialog_r_ind = None
+        self.focused_r_ind = None
+        self.focused_type = None
+        self.focused_fig = None
         
         # EIS data objects and ref values
         self.display_mode = [None]*self.max_num_rasters
@@ -85,12 +96,16 @@ class MainWindow(QtWidgets.QWidget):
         self.rast_wcoords = [None]*self.max_num_rasters #only used for obs data
         self.rast_slice_ind = [None]*self.max_num_rasters #only used for CCD
         self.rast_slice_coord = [None]*self.max_num_rasters #only used for CCD
+        self.rast_xaxis_type = [None]*self.max_num_rasters
+        self.rast_auto_aspect = [None]*self.max_num_rasters
+        self.rast_xydelta = [None]*self.max_num_rasters
+        self.spec_xydelta = [None]*self.max_num_rasters
 
         # Controls and plots for each image
-        self.label_filepath = [None]*self.max_num_rasters
         self.button_select = [None]*self.max_num_rasters
         self.box_file_list = [None]*self.max_num_rasters
         self.box_cmap = [None]*self.max_num_rasters
+        self.box_cnorm = [None]*self.max_num_rasters
         self.box_line_id = [None]*self.max_num_rasters
         self.box_var = [None]*self.max_num_rasters
         self.rast_nav = [None]*self.max_num_rasters
@@ -99,23 +114,27 @@ class MainWindow(QtWidgets.QWidget):
         self.rast_ax = [None]*self.max_num_rasters
         self.rast_img = [None]*self.max_num_rasters
         self.rast_lims = [None]*self.max_num_rasters
-        self.button_reset_rast = [None]*self.max_num_rasters #NEW!
-        self.spec_nav = [None]*self.max_num_rasters # NEW!
+        self.button_rast_lims = [None]*self.max_num_rasters
+        self.button_reset_rast = [None]*self.max_num_rasters
+        self.spec_nav = [None]*self.max_num_rasters
         self.spec_fig = [None]*self.max_num_rasters
         self.spec_canvas = [None]*self.max_num_rasters
         self.spec_ax = [None]*self.max_num_rasters
         self.spec_lims = [None]*self.max_num_rasters
-        self.button_reset_spec = [None]*self.max_num_rasters #NEW!
+        self.button_reset_spec = [None]*self.max_num_rasters
 
         # Matplotlib click events and selected values
         self.rast_click = [None]*self.max_num_rasters
+        self.rast_keyboard = [None]*self.max_num_rasters
         self.rast_crosshair = [None]*self.max_num_rasters
         self.rast_axhline = [None]*self.max_num_rasters
         self.rast_axvline = [None]*self.max_num_rasters
         self.crosshair_new_coords = [None]*self.max_num_rasters
         self.crosshair_old_coords = [None]*self.max_num_rasters
         self.crosshair_ind = [None]*self.max_num_rasters
+        self.crosshair_val = [None]*self.max_num_rasters
         self.spec_click = [None]*self.max_num_rasters
+        self.spec_keyboard = [None]*self.max_num_rasters
         self.spec_vline_val = [None]*self.max_num_rasters
         self.spec_vline_ind = [None]*self.max_num_rasters
 
@@ -140,6 +159,12 @@ class MainWindow(QtWidgets.QWidget):
         self.vel_cmap_list = ['RdBu_r', 'coolwarm', 'seismic', 
                               'Spectral_r', 'RdYlBu_r', 'PuOr_r', 'hmimag']
         
+        self.default_crosshair_color = 'violet'
+        self.vel_crosshair_color = 'blueviolet'
+        self.alt_crosshair_color = 'deepskyblue'
+        self.alt_crosshair_cmaps = ['gist_heat', 'inferno', 'plasma', 
+                                    'cubehelix', 'sdoaia211']
+        
         # Basic buttons and info on far left
         self.button_quit = QtWidgets.QPushButton('Quit')
         self.button_quit.setFont(self.font_default)
@@ -158,6 +183,11 @@ class MainWindow(QtWidgets.QWidget):
         self.box_layout.setFont(self.font_default)
         self.box_layout.setCurrentIndex(1)
         self.box_layout.currentIndexChanged.connect(self.event_change_layout)
+        
+        self.radio_placeholder = QtWidgets.QCheckBox("[not implemented]")
+        self.radio_placeholder.setFixedWidth(2*self.base_width)
+        self.radio_placeholder.setFont(self.font_default)
+        self.radio_placeholder.setChecked(True)
 
         self.radio_sync_cross = QtWidgets.QCheckBox("Sync crosshairs")
         self.radio_sync_cross.setFixedWidth(2*self.base_width)
@@ -200,11 +230,6 @@ class MainWindow(QtWidgets.QWidget):
         # Sets of controls and figures for each raster
         for r in range(self.max_num_rasters):
             # Buttons and drop-down lsits
-            self.label_filepath[r] = QtWidgets.QLabel()
-            self.label_filepath[r].setFont(self.font_small)
-            self.label_filepath[r].setText("No file selected")
-            self.label_filepath[r].setFixedHeight(40)
-
             self.button_select[r] = QtWidgets.QPushButton('Open')
             self.button_select[r].setObjectName(f'r{r}_select')
             self.button_select[r].setFont(self.font_default)
@@ -237,6 +262,19 @@ class MainWindow(QtWidgets.QWidget):
             self.box_var[r].setFont(self.font_default)
             self.box_var[r].currentIndexChanged.connect(self.event_plot_raster)
 
+            self.box_cnorm[r] = QtWidgets.QComboBox()
+            self.box_cnorm[r].setObjectName(f'r{r}_cnorm')
+            self.box_cnorm[r].addItems(['asinh norm', 'linear norm', 'sqrt norm', 'log norm'])
+            self.box_cnorm[r].setFixedWidth(self.base_width)
+            self.box_cnorm[r].setFont(self.font_small)
+            self.box_cnorm[r].setCurrentIndex(1)
+            self.box_cnorm[r].currentIndexChanged.connect(self.event_plot_raster)
+
+            self.button_rast_lims[r] = QtWidgets.QPushButton('Set Limits / Crosshair')
+            self.button_rast_lims[r].setObjectName(f'r{r}_rast_limits')
+            self.button_rast_lims[r].setFont(self.font_default)
+            self.button_rast_lims[r].clicked.connect(self.event_lim_dialog)
+
             self.button_reset_rast[r] = QtWidgets.QPushButton('Reset')
             self.button_reset_rast[r].setObjectName(f'r{r}_rast_reset')
             self.button_reset_rast[r].setFont(self.font_default)
@@ -252,10 +290,14 @@ class MainWindow(QtWidgets.QWidget):
             # Setup the matplotlib figures
             self.rast_fig[r] = Figure(figsize=(3, 5), constrained_layout=False)
             self.rast_canvas[r] = FigureCanvas(self.rast_fig[r])
+            self.rast_canvas[r].setFocusPolicy(QtCore.Qt.ClickFocus)
+            self.rast_canvas[r].AltObjectName = f'r{r}_rast_canvas'
             self.rast_nav[r] = NavigationToolbar(self.rast_canvas[r], self)
                         
             self.spec_fig[r] = Figure(figsize=(2, 2), constrained_layout=True)
-            self.spec_canvas[r] = FigureCanvas(self.spec_fig[r])            
+            self.spec_canvas[r] = FigureCanvas(self.spec_fig[r])
+            self.spec_canvas[r].setFocusPolicy(QtCore.Qt.ClickFocus)
+            self.spec_canvas[r].AltObjectName = f'r{r}_spec_canvas'
             self.spec_nav[r] = NavigationToolbar(self.spec_canvas[r], self)
 
         self.arange_layout(layout_index=1)
@@ -271,45 +313,45 @@ class MainWindow(QtWidgets.QWidget):
             self.main_grid.addWidget(self.button_quit, 0, 0)
             self.main_grid.addWidget(self.button_open_all, 1, 0)
             self.main_grid.addWidget(self.box_layout, 2, 0)
-            self.main_grid.addWidget(self.radio_sync_cross, 3, 0)
-            # self.main_grid.addWidget(self.label_inten_cmap, 4, 0) 
-            # self.main_grid.addWidget(self.box_inten_cmap, 5, 0) 
-            self.main_grid.addWidget(self.label_tips, 4, 0) 
-            self.main_grid.addWidget(self.radio_autoscale_ylim, 6, 0)
-            self.main_grid.addWidget(self.radio_sync_vline, 7, 0)
-            self.main_grid.addWidget(self.radio_show_ids, 8, 0)
-            self.main_grid.addWidget(self.radio_show_details, 9, 0)
+            self.main_grid.addWidget(self.radio_placeholder, 3, 0) # <-- NEW!
+            self.main_grid.addWidget(self.radio_sync_cross, 4, 0)
+            self.main_grid.addWidget(self.label_tips, 5, 0) 
+            self.main_grid.addWidget(self.radio_autoscale_ylim, 7, 0)
+            self.main_grid.addWidget(self.radio_sync_vline, 8, 0)
+            self.main_grid.addWidget(self.radio_show_ids, 9, 0)
+            self.main_grid.addWidget(self.radio_show_details, 10, 0)
 
             # Setup frames and grids for each figure (better control of layout)
             for r in range(0, self.max_num_rasters):
                 self.sub_frame[r] = QtWidgets.QFrame()
                 self.sub_grid[r] = QtWidgets.QGridLayout(self.sub_frame[r])
                 self.sub_grid[r].setContentsMargins(0, 0, 0, 0)
-                # self.sub_grid[r].setVerticalSpacing(0)
-                # self.sub_grid[r].addWidget(self.label_filepath[r], 0, 0, 1, 3)
                 self.sub_grid[r].addWidget(self.button_select[r], 0, 0)
                 self.sub_grid[r].addWidget(self.box_file_list[r], 0, 1, 1, 2)
                 self.sub_grid[r].addWidget(self.box_cmap[r], 1, 0)
                 self.sub_grid[r].addWidget(self.box_line_id[r], 1, 1)
                 self.sub_grid[r].addWidget(self.box_var[r], 1, 2)
-                self.sub_grid[r].addWidget(self.button_reset_rast[r], 2, 0)
-                self.sub_grid[r].addWidget(self.rast_nav[r], 2, 1, 1, 2)
-                self.sub_grid[r].addWidget(self.rast_canvas[r], 3, 0, 4, 3)
-                self.sub_grid[r].addWidget(self.spec_canvas[r], 7, 0, 2, 3)
-                self.sub_grid[r].addWidget(self.button_reset_spec[r], 9, 0)
-                self.sub_grid[r].addWidget(self.spec_nav[r], 9, 1, 1, 2)
-
+                self.sub_grid[r].addWidget(self.box_cnorm[r], 2, 0)
+                self.sub_grid[r].addWidget(self.button_rast_lims[r], 2, 2)
+                self.sub_grid[r].addWidget(self.button_reset_rast[r], 3, 0)
+                self.sub_grid[r].addWidget(self.rast_nav[r], 3, 1, 1, 2)
+                self.sub_grid[r].addWidget(self.rast_canvas[r], 4, 0, 4, 3)
+                self.sub_grid[r].addWidget(self.spec_canvas[r], 8, 0, 2, 3)
+                self.sub_grid[r].addWidget(self.button_reset_spec[r], 10, 0)
+                self.sub_grid[r].addWidget(self.spec_nav[r], 10, 1, 1, 2)
 
                 self.sub_frame[r].setLayout(self.sub_grid[r])
                 self.sub_frame[r].sizePolicy().setHorizontalStretch(1)
 
         if layout_index == 0:
             ## Single image: Two col layout of raster (left) & spectrum (right)
-            self.sub_grid[0].addWidget(self.rast_canvas[0], 3, 0, 6, 3)
-            self.sub_grid[0].addWidget(self.spec_canvas[0], 3, 3, 3, 3)
-            self.sub_grid[0].addWidget(self.button_reset_spec[0], 2, 3)
-            self.sub_grid[0].addWidget(self.spec_nav[0], 2, 4, 1, 2)
-            self.main_grid.addWidget(self.sub_frame[0], 0, 1, 10, 3*self.max_num_rasters)
+            
+            # Rearange first panel of plots into the two col format (full window width)
+            self.sub_grid[0].addWidget(self.rast_canvas[0], 4, 0, 6, 3)
+            self.sub_grid[0].addWidget(self.spec_canvas[0], 4, 3, 3, 3)
+            self.sub_grid[0].addWidget(self.button_reset_spec[0], 3, 3)
+            self.sub_grid[0].addWidget(self.spec_nav[0], 3, 4, 1, 2)
+            self.main_grid.addWidget(self.sub_frame[0], 0, 1, 11, 3*self.max_num_rasters)
 
             # Hide all unused figure frames
             for r in range(1, self.max_num_rasters):
@@ -324,8 +366,8 @@ class MainWindow(QtWidgets.QWidget):
             self.main_grid.setColumnStretch(1, 1)
             self.main_grid.setColumnStretch(2, 1)
             self.main_grid.setColumnStretch(3, 1)
-            self.main_grid.setRowStretch(3, 3) 
-            self.main_grid.setRowStretch(7, 1) 
+            self.main_grid.setRowStretch(4, 3) 
+            self.main_grid.setRowStretch(8, 1) 
             if self.max_num_rasters >= 3:
                 for r in range(2, self.max_num_rasters):
                     self.main_grid.setColumnStretch(1+3*r, 0)
@@ -334,18 +376,18 @@ class MainWindow(QtWidgets.QWidget):
 
         elif layout_index >= 1:
             # Multiple images: Raster (top) & spectrum (bottom) in SAME col
-            self.sub_grid[0].addWidget(self.rast_canvas[0], 3, 0, 4, 3)
-            self.sub_grid[0].addWidget(self.spec_canvas[0], 7, 0, 2, 3)
-            self.sub_grid[0].addWidget(self.spec_nav[0], 9, 0, 1, 3)
-            self.sub_grid[0].addWidget(self.button_reset_spec[0], 9, 0)
-            self.sub_grid[0].addWidget(self.spec_nav[0], 9, 1, 1, 2)
-            self.main_grid.addWidget(self.sub_frame[0], 0, 1, 10, 3)
-
+            
+            # Ensure first panel of plots is the single col format
+            self.sub_grid[0].addWidget(self.rast_canvas[0], 4, 0, 4, 3)
+            self.sub_grid[0].addWidget(self.spec_canvas[0], 8, 0, 2, 3)
+            self.sub_grid[0].addWidget(self.button_reset_spec[0], 10, 0)
+            self.sub_grid[0].addWidget(self.spec_nav[0], 10, 1, 1, 2)
+            self.main_grid.addWidget(self.sub_frame[0], 0, 1, 11, 3)
 
             # Show only the selected number of figures
             for r in range(1, self.max_num_rasters):
                 if r <= layout_index:
-                    self.main_grid.addWidget(self.sub_frame[r], 0, 1+3*r, 10, 3) 
+                    self.main_grid.addWidget(self.sub_frame[r], 0, 1+3*r, 11, 3) 
                     self.sub_frame[r].show()
                 else:
                     self.main_grid.addWidget(self.sub_frame[r], 0, 0+r)
@@ -353,8 +395,8 @@ class MainWindow(QtWidgets.QWidget):
             
             # Setting stretch on grid for better resizing
             self.main_grid.setColumnStretch(0, 0)
-            self.main_grid.setRowStretch(3, 3) 
-            self.main_grid.setRowStretch(7, 1)
+            self.main_grid.setRowStretch(4, 3) 
+            self.main_grid.setRowStretch(8, 1)
             for r in range(0, self.max_num_rasters):
                 if r <= layout_index:
                     self.main_grid.setColumnStretch(1+3*r, 0)
@@ -387,14 +429,15 @@ class MainWindow(QtWidgets.QWidget):
             r_ind = 0
 
         if os.path.isfile(filepath) and filepath.endswith('.fit.h5'):
-            # Load fit results
+            # [FIT MODE] Load fit results
             self.display_mode[r_ind] = 'fit'
             self.fit_filepath[r_ind] = filepath
             self.fit_res[r_ind] = eispac.read_fit(filepath)
             self.inten_units[r_ind] = self.fit_res[r_ind].data_units
             file_dir = os.path.dirname(filepath)
+            file_nraster = self.fit_res[r_ind].meta['mod_index']['nraster']
             try:
-                # Loook for level-1 data in original source location
+                # Look for level-1 data in original source location
                 this_cube_filepath = self.fit_res[r_ind].meta['filename_data']
                 if not os.path.isfile(this_cube_filepath):
                     this_cube_filepath = None
@@ -414,6 +457,7 @@ class MainWindow(QtWidgets.QWidget):
                                                         apply_radcal=apply_radcal)
                 self.cube_win_ind[r_ind] = self.eis_cube[r_ind].meta['iwin']
                 self.obs_type[r_ind] = self.eis_cube[r_ind].meta['mod_index']['obs_type']
+                self.check_fit_and_cube_dims(r_ind=r_ind)
             else:
                 # Clear old object
                 self.cube_filepath[r_ind] = None
@@ -422,7 +466,7 @@ class MainWindow(QtWidgets.QWidget):
                 self.obs_type[r_ind] = None
 
         elif os.path.isfile(filepath) and filepath.endswith(('.data.h5', '.head.h5')):
-            # Load EISCube object (window CAN be selected later)
+            # [OBS MODE] Load EISCube object (window CAN be selected later)
             filepath = filepath.replace('.head.', '.data.')
             self.display_mode[r_ind] = 'obs'
             self.fit_filepath[r_ind] = None
@@ -433,11 +477,20 @@ class MainWindow(QtWidgets.QWidget):
             self.inten_units[r_ind] = self.eis_cube[r_ind].meta['mod_index']['bunit']
             self.obs_type[r_ind] = self.eis_cube[r_ind].meta['mod_index']['obs_type']
             self.rast_wcoords[r_ind] = None
+            file_nraster = self.eis_cube[r_ind].meta['mod_index']['nraster']
             # self.spec_vline_ind[r_ind] = None
             # self.spec_vline_val[r_ind] = None
         else:
             return # If invalid file, do nothing
         
+        # Append raster type to display mode
+        if file_nraster == 1:
+            # Sit-and-stare data
+            self.display_mode[r_ind] = self.display_mode[r_ind] + 'sns'
+        else:
+            # Scan data
+            self.display_mode[r_ind] = self.display_mode[r_ind] + 'scan'
+            
         # Update text and plots
         self.update_filepath(r_ind=r_ind)
         self.update_line_id_box(r_ind=r_ind)
@@ -461,7 +514,38 @@ class MainWindow(QtWidgets.QWidget):
                 self.update_var_box(r_ind=r)
                 self.plot_raster(r_ind=r)
 
+    def check_fit_and_cube_dims(self, r_ind=0):
+        """Ensure that EISFitResult & EISCube objects have matching coords"""
+        fit_meta = self.fit_res[r_ind].meta['mod_index']
+        cube_meta = self.eis_cube[r_ind].meta['mod_index']
+        
+        fit_naxis = [fit_meta['naxis1'], fit_meta['naxis2']]
+        cube_naxis = [cube_meta['naxis1'], cube_meta['naxis2']]
+    
+        if fit_naxis == cube_naxis:
+            # Shapes match, no need to crop
+            return
+        else:
+            print('Cropping EISCube to match EISFitResult...')
+
+        # If shapes do NOT match, will need to crop the cube to match the fit
+        # NB: x/y coords give pixel CENTERS and FITS headers are 1 indexed
+        xdelta, ydelta = fit_meta['cdelt1'], fit_meta['cdelt2']
+        bot_left = [fit_meta['crval1'] - xdelta*(fit_meta['crpix1']-1), 
+                         fit_meta['crval2'] - ydelta*(fit_meta['crpix2']-1)]
+        top_right = [bot_left[0] + xdelta*(fit_naxis[0]-1), 
+                     bot_left[1] + ydelta*(fit_naxis[1]-1)]
+        
+        # Make the SkyCords objects and apply the crop
+        cube_frame = wcs_to_celestial_frame(self.eis_cube[r_ind].wcs)
+        bl_coord = [None, SkyCoord(Tx=bot_left[0], Ty=bot_left[1], 
+                                   unit=u.arcsec, frame=cube_frame)]
+        tr_coord = [None, SkyCoord(Tx=top_right[0], Ty=top_right[1], 
+                                   unit=u.arcsec, frame=cube_frame)]
+        self.eis_cube[r_ind] = self.eis_cube[r_ind].crop(bl_coord, tr_coord)
+
     def update_filepath(self, r_ind=0):
+        """Scan current dir and set dropdown box of .h5 files for quick selection"""
         this_filepath = None
         if self.display_mode[r_ind].lower().startswith('fit'):
             this_filepath = self.fit_filepath[r_ind]
@@ -488,12 +572,10 @@ class MainWindow(QtWidgets.QWidget):
             self.box_file_list[r_ind].setCurrentIndex(this_file_ind)
             self.box_file_list[r_ind].setToolTip(f"Current dir: {dir_name}")
 
-            self.label_filepath[r_ind].setText(f"File dir: {dir_name}/\nFilename: {f_name}")
-        else:
-            self.label_filepath[r_ind].setText("No file selected")
         self.box_file_list[r_ind].currentIndexChanged.connect(self.event_quick_select)
 
     def update_line_id_box(self, r_ind=0):
+        """Get available windows / fit line_ids and set dropdown box options"""
         self.box_line_id[r_ind].currentIndexChanged.disconnect(self.event_plot_raster)
         curr_line_ind = self.box_line_id[r_ind].currentIndex()
         
@@ -527,26 +609,23 @@ class MainWindow(QtWidgets.QWidget):
         self.box_line_id[r_ind].currentIndexChanged.connect(self.event_plot_raster)
 
     def update_var_box(self, r_ind=0):
+        """Get available vars/sum bin widths and set dropdown box options"""
         self.box_var[r_ind].currentIndexChanged.disconnect(self.event_plot_raster)
         curr_var_ind = self.box_var[r_ind].currentIndex()
         self.box_var[r_ind].clear()
 
         if self.display_mode[r_ind].lower().startswith('fit'):
-            var_list = ['Intensity (asinh)', 'Intensity (linear)', 'Velocity', 'Width']
+            var_list = ['Intensity ', 'Velocity', 'Width', 'Centroid', 'Reduced Chi-sq']
             default_var_ind = 0
         elif self.display_mode[r_ind].lower().startswith('obs'):
-            var_list = ['3-bin sum (asinh)', '5-bin sum (asinh)', 
-                        '7-bin sum (asinh)', '9-bin sum (asinh)', 
-                        '11-bin sum (asinh)', 'Total (asinh)',
-                        '3-bin sum (linear)', '5-bin sum (linear)', 
-                        '7-bin sum (linear)', '9-bin sum (linear)', 
-                        '11-bin sum (linear)', 'Total (linear)']
+            var_list = ['3-bin sum', '5-bin sum', 
+                        '7-bin sum', '9-bin sum', 
+                        '11-bin sum', 'Total']
             default_var_ind = 2
 
         # If a full EISCube with the level-1 data is loaded, add CCD option
         if self.eis_cube[r_ind] is not None:
-            var_list.append('CCD (asinh)')
-            var_list.append('CCD (linear)')
+            var_list.append('CCD view')
 
         self.box_var[r_ind].addItems(var_list)
         if self.rast_lims[r_ind] is not None and curr_var_ind < len(var_list):
@@ -630,18 +709,24 @@ class MainWindow(QtWidgets.QWidget):
                 self.rast_slice_coord[r_ind] = None
 
             # Get current colormap and requested nomalization
-            # inten_cmap = self.box_inten_cmap.currentText()
             current_cmap = self.box_cmap[r_ind].currentText()
-            if var_str.lower().endswith('(asinh)'):
+            current_cnorm = self.box_cnorm[r_ind].currentText()
+            self.box_cnorm[r_ind].setEnabled(True)
+            if current_cnorm.lower().startswith('asinh'):
                 inten_scale = AsinhStretch()
-            elif var_str.lower().endswith('(linear)'):
+            elif current_cnorm.lower().startswith('linear'):
                 inten_scale = LinearStretch()
+            elif current_cnorm.lower().startswith('sqrt'):
+                inten_scale = SqrtStretch()
+            elif current_cnorm.lower().startswith('log'):
+                inten_scale = LogStretch()
             else:
                 inten_scale = AsinhStretch()
 
             # [FIT MODE] Plotting fit results
             if self.display_mode[r_ind].lower().startswith('fit'):
                 self.rast_wcoords[r_ind] = None
+                self.spec_xydelta[r_ind] = None
                 self.spec_vline_ind[r_ind] = None
                 self.spec_vline_val[r_ind] = None
                 self.wave_bin_width[r_ind] = None
@@ -670,6 +755,7 @@ class MainWindow(QtWidgets.QWidget):
                     valid_cmap_list = self.vel_cmap_list
                     default_cmap = 'RdBu_r'
                     rast_norm = ImageNormalize(vmin=-vel_vlim, vmax=vel_vlim)
+                    self.box_cnorm[r_ind].setDisabled(True)
                 elif var_str.lower().startswith('wid'):
                     this_var = 'width'
                     rast_data = self.fit_res[r_ind].fit['params'][:,:,2+3*component_index] #compat with old files
@@ -679,7 +765,28 @@ class MainWindow(QtWidgets.QWidget):
                     width_vmin = np.min(rast_data[np.where(rast_data > 0)])
                     valid_cmap_list = self.inten_cmap_list
                     default_cmap = 'viridis'
-                    rast_norm = ImageNormalize(vmin=width_vmin, vmax=width_vmax)
+                    rast_norm = ImageNormalize(vmin=width_vmin, vmax=width_vmax,
+                                               stretch=inten_scale)
+                elif var_str.lower().startswith('cen'):
+                    this_var = 'centroid'
+                    rast_data = self.fit_res[r_ind].fit['params'][:,:,1+3*component_index]
+                    rast_units = 'Angstrom'
+                    cen_vmax = np.nanpercentile(rast_data, 99.5)
+                    cen_vmin = np.nanpercentile(rast_data, 0.5)
+                    valid_cmap_list = self.inten_cmap_list
+                    default_cmap = 'cubehelix'
+                    rast_norm = ImageNormalize(vmin=cen_vmin, vmax=cen_vmax,
+                                               stretch=inten_scale)
+                elif var_str.lower().endswith('chi-sq'):
+                    this_var = 'chisq'
+                    rast_data = self.fit_res[r_ind].fit['chi2']
+                    rast_units = 'unitless'
+                    chisq_vmax = np.nanpercentile(rast_data, 99)
+                    chisq_vmin = 0.0
+                    valid_cmap_list = self.inten_cmap_list
+                    default_cmap = 'turbo'
+                    rast_norm = ImageNormalize(vmin=chisq_vmin, vmax=chisq_vmax,
+                                               stretch=inten_scale)
 
             # [OBS MODE] Plotting EIS level-1 data cubes
             elif self.display_mode[r_ind].lower().startswith('obs'):
@@ -699,6 +806,7 @@ class MainWindow(QtWidgets.QWidget):
                 
                 # Compute wavelength coord array
                 rast_index = self.eis_cube[r_ind].meta['mod_index']
+                self.spec_xydelta[r_ind] = [rast_index['cdelt3'], 0.0]
                 if self.rast_wcoords[r_ind] is None:
                     n_waves = int(self.eis_cube[r_ind].data.shape[2])
                     base_wave = rast_index['crval3']
@@ -807,28 +915,48 @@ class MainWindow(QtWidgets.QWidget):
                     self.rast_slice_coord[r_ind] = 0.0 + rast_cad*(ccd_exp_ind-1)
                 else:
                     # Scan raster (space-space)
-                    self.rast_slice_coord[r_ind] = rast_index['crval1'] + rast_index['cdelt1']*(ccd_exp_ind-1)
+                    self.rast_slice_coord[r_ind] = rast_index['crval1'] + rast_index['cdelt1']*(ccd_exp_ind)
 
                 # Set base coordinate variables for space-wavelength img (CCD)
-                xlabel_text = "Wavelength [$\AA$]"
+                self.rast_xaxis_type[r_ind] = 'Wavelength'
+                slice_label = f"slice at X = {self.rast_slice_coord[r_ind]:.2f}″ [{ccd_exp_ind}]"
+                xlabel_text = f"Wavelength [$\AA$] ({slice_label})"
+                ylabel_text = "Solar-Y [arcsec]"
                 n_xaxis, n_yaxis = rast_index['naxis3'], rast_index['naxis2']
                 xdelta, ydelta = rast_index['cdelt3'], rast_index['cdelt2']
-                rast_bot_left = [rast_index['crval3'], rast_index['crval2']]
+                rast_bot_left = [rast_index['crval3'], 
+                                 rast_index['crval2'] - ydelta*(rast_index['crpix2']-1)]
                 rast_aspect = 'auto'
             elif rast_index['nraster'] == 1:
                 # Base coordinate variables for space-time img (sit-and-stare)
+                self.rast_xaxis_type[r_ind] = 'Time'
                 xlabel_text = "Time elapsed [s]"
+                ylabel_text = "Solar-Y [arcsec]"
                 n_xaxis, n_yaxis = rast_index['naxis1'], rast_index['naxis2']
                 xdelta, ydelta = rast_cad, rast_index['cdelt2']
-                rast_bot_left = [0.0, rast_index['crval2']]
+                rast_bot_left = [0.0 - xdelta*(rast_index['crpix1']-1), 
+                                 rast_index['crval2'] - ydelta*(rast_index['crpix2']-1)]
                 rast_aspect = 'auto'
             else:
                 # Base coordinate variables for space-space img (scan)
+                self.rast_xaxis_type[r_ind] = 'Solar-X'
                 xlabel_text = "Solar-X [arcsec]"
+                ylabel_text = "Solar-Y [arcsec]"
                 n_xaxis, n_yaxis = rast_index['naxis1'], rast_index['naxis2']
                 xdelta, ydelta = rast_index['cdelt1'], rast_index['cdelt2']
-                rast_bot_left = [rast_index['crval1'], rast_index['crval2']]
-                rast_aspect = 'equal'
+                rast_bot_left = [rast_index['crval1'] - xdelta*(rast_index['crpix1']-1), 
+                                 rast_index['crval2'] - ydelta*(rast_index['crpix2']-1)]
+                if self.rast_auto_aspect[r_ind] is True and not last_var.endswith('ccd'):
+                    # Only used after user has changed the limits via dialog box
+                    rast_aspect = 'auto'
+                else:
+                    # Default, force pixels to be square
+                    rast_aspect = 'equal'
+                    self.rast_auto_aspect[r_ind] = False
+
+            # Update aspect flag (checked when adjusting limits via dialog box)
+            if rast_aspect == 'auto':
+                self.rast_auto_aspect[r_ind] = True
                 
             # Compute coordinate arrays
             # NB: x/y coords give pixel CENTERS while extend gives min/max edges
@@ -840,7 +968,8 @@ class MainWindow(QtWidgets.QWidget):
                                                    num=n_xaxis)
             self.rast_ycoords[r_ind] = np.linspace(rast_bot_left[1], rast_top_right[1], 
                                                    num=n_yaxis)
-            
+            self.rast_xydelta[r_ind] = [xdelta, ydelta]
+
             # Select cmap and and Update cmap box
             if this_var == last_var and current_cmap in valid_cmap_list:
                 rast_cmap = current_cmap
@@ -857,9 +986,10 @@ class MainWindow(QtWidgets.QWidget):
             self.file_date_obs[r_ind] = rast_index['date_obs']
             self.rast_ax[r_ind] = self.rast_fig[r_ind].subplots()
             self.rast_img[r_ind] = self.rast_ax[r_ind].imshow(rast_data, extent=subplot_extent, 
-                                origin='lower', cmap=rast_cmap, norm=rast_norm, aspect=rast_aspect)
+                                origin='lower', cmap=rast_cmap, norm=rast_norm, 
+                                aspect=rast_aspect, interpolation='nearest')
             self.rast_ax[r_ind].set_xlabel(xlabel_text, fontsize=10)
-            self.rast_ax[r_ind].set_ylabel("Solar-Y [arcsec]", fontsize=10)
+            self.rast_ax[r_ind].set_ylabel(ylabel_text, fontsize=10)
 
             rast_cbar = self.rast_fig[r_ind].colorbar(self.rast_img[r_ind], ax=self.rast_ax[r_ind], pad=0.01)
             rast_cbar.set_label(f"[{rast_units}]", fontsize=10)
@@ -883,7 +1013,13 @@ class MainWindow(QtWidgets.QWidget):
             self.rast_img[r_ind].figure.canvas.draw_idle() # Update the plot!
             self.rast_ax[r_ind].autoscale(False) # Fixes issue with zooming
 
+            # Check if dialog box is open and update as needed
+            if self.lim_dialog is not None and self.lim_dialog.isVisible():
+                if self.dialog_r_ind == r_ind:
+                    self.lim_dialog.read_rast_limits(self) # update img limits
+
             self.rast_click[r_ind] = self.rast_img[r_ind].figure.canvas.mpl_connect('button_press_event', self.event_rast_click)
+            # self.rast_keyboard[r_ind] = self.rast_img[r_ind].figure.canvas.mpl_connect('key_press_event', self.event_keyboard_nav)
             self.plot_crosshair(r_ind=r_ind) # this will also call plot_spectrum()
 
     def plot_crosshair(self, r_ind=0):
@@ -905,7 +1041,7 @@ class MainWindow(QtWidgets.QWidget):
                 else:
                     old_x_val, old_y_val = rast_xmin-999, rast_ymin-999
 
-                # If CCD mode is ON, effectively ignore new_x_val
+                # If CCD mode is ON, ignore new_x_val for now (corrected before plotting)
                 if self.display_mode[r_ind].lower().endswith('ccd'):
                     new_x_val = (rast_xmin + rast_xmax)/2.0 # always valid
 
@@ -936,6 +1072,8 @@ class MainWindow(QtWidgets.QWidget):
         if self.rast_crosshair[r_ind] is not None:
             self.rast_crosshair[r_ind].remove()
             self.rast_crosshair[r_ind] = None
+            if self.rast_ax[r_ind].get_legend() is not None:
+                self.rast_ax[r_ind].get_legend().remove()   
 
         # Remove horizontal and vertical lines
         if self.rast_axhline[r_ind] is not None:
@@ -944,16 +1082,44 @@ class MainWindow(QtWidgets.QWidget):
         if self.rast_axvline[r_ind] is not None:
             self.rast_axvline[r_ind].remove()
             self.rast_axvline[r_ind] = None
-            
+
+        # If CCD mode is on, place the crosshair in the correct location   
+        if crosshair_in_axes and self.display_mode[r_ind].lower().endswith('ccd'):
+            x_val = self.spec_vline_val[r_ind]
+            # Ensure the x-coord slice index remains fixed
+            if self.rast_slice_ind[r_ind] is not None:
+                self.crosshair_ind[r_ind][0] = self.rast_slice_ind[r_ind]
+
+        # Lookup the crosshair color
+        current_cmap = self.box_cmap[r_ind].currentText()
+        if current_cmap in self.vel_cmap_list:
+            c_color = self.vel_crosshair_color
+        elif current_cmap in self.alt_crosshair_cmaps:
+            c_color = self.alt_crosshair_color
+        else:
+            c_color = self.default_crosshair_color
+
         # Plot new crosshair (if raster is currently visible)
-        if crosshair_in_axes and r_ind <= self.curr_layout_ind:
-            self.rast_crosshair[r_ind] = self.rast_ax[r_ind].scatter(x_val, y_val, s=24, 
-                                                         c='violet', marker='x')
+        if crosshair_in_axes and r_ind <= self.curr_layout_ind and x_val is not None:
+            # Extract the image value at the corsshair coordinates
+            c_ix = np.argmin(np.abs(self.rast_xcoords[r_ind] - x_val))
+            c_iy = self.crosshair_ind[r_ind][1]
+            self.crosshair_val[r_ind] = self.rast_img[r_ind].get_array()[c_iy, c_ix]
+            cross_label = str(round(self.crosshair_val[r_ind], 2))
+
+            # Plot crosshair and display legend
+            self.rast_crosshair[r_ind] = self.rast_ax[r_ind].scatter(x_val, y_val, s=30, 
+                                                         c=c_color, marker='x',
+                                                         label=cross_label)
+
+            self.rast_ax[r_ind].legend(loc='lower right', frameon=False, handlelength=1.0, 
+                                       bbox_to_anchor=(1.2, -0.11), borderaxespad=0.0, 
+                                       alignment='right', handletextpad=0.6)
 
             # Plot horizontal and vertical lines 
             if self.display_mode[r_ind].lower().endswith('ccd'):
                 # If CCD mode is ON, add a horizontal line
-                self.rast_axhline[r_ind] = self.rast_ax[r_ind].axhline(y_val, color='violet', ls='--')
+                self.rast_axhline[r_ind] = self.rast_ax[r_ind].axhline(y_val, color=c_color, ls='--')
             else:
                 # Check if OTHER rasters of the same timestamp have CCD mode on
                 for other_r in range(self.max_num_rasters):
@@ -962,10 +1128,16 @@ class MainWindow(QtWidgets.QWidget):
                     elif (str(self.display_mode[other_r]).lower().endswith('ccd')
                     and str(self.file_date_obs[other_r]) == str(self.file_date_obs[r_ind])):
                         # Add vertical line to show CCD mode of OTHER rast
-                        self.rast_axvline[r_ind] = self.rast_ax[r_ind].axvline(x_val, color='violet', ls='--')
+                        self.rast_axvline[r_ind] = self.rast_ax[r_ind].axvline(x_val, color=c_color, ls='--')
 
             self.rast_img[r_ind].figure.canvas.draw_idle() # Update the plot!
+
             self.plot_spectrum(r_ind=r_ind)
+
+        # Check if dialog box is open and update as needed
+        if self.lim_dialog is not None and self.lim_dialog.isVisible():
+            if self.dialog_r_ind == r_ind:
+                self.lim_dialog.read_rast_crosshair(self) # Update crosshair coords
         else:
             self.plot_spectrum(r_ind=r_ind) # just update or show empty
 
@@ -1006,18 +1178,19 @@ class MainWindow(QtWidgets.QWidget):
             ls_list = ['-', '-', '-', '-', '-', '-', 
                        '--', '--', '--', '--', '--', '--']
 
-            # Load data array indices
-            x_ind = self.crosshair_ind[r_ind][0]
+            # Load Y-axis data array index and coordinate value
             y_ind = self.crosshair_ind[r_ind][1]
-
-            # Get X/Y coordinate values
-            x_val = self.rast_xcoords[r_ind][x_ind]
             y_val = self.rast_ycoords[r_ind][y_ind]
 
-            # IF CCD mode is ON, restore the real X-axis index and coord
+            # Load X-axis data array index and coordinate value
             if self.display_mode[r_ind].lower().endswith('ccd'):
+                # IF CCD mode is ON, use the saved slice X-axis index and coord
                 x_ind = self.rast_slice_ind[r_ind]
                 x_val = self.rast_slice_coord[r_ind]
+            else:
+                # Otherwise, use load values as expected
+                x_ind = self.crosshair_ind[r_ind][0]
+                x_val = self.rast_xcoords[r_ind][x_ind]
 
             # Plot the actual data values (if loaded)
             if self.eis_cube[r_ind] is not None:
@@ -1094,6 +1267,23 @@ class MainWindow(QtWidgets.QWidget):
                                             horizontalalignment='left',
                                             verticalalignment='top',
                                             transform=self.spec_ax[r_ind].transAxes)
+            elif self.spec_vline_val[r_ind] is not None and self.fit_res[r_ind] is None:
+                # [CCD mode] Plotting reference line matching crosshair coords
+                base_spec_xlim = self.spec_ax[r_ind].get_xlim()
+                self.spec_ax[r_ind].axvline(self.spec_vline_val[r_ind], color='grey', ls=':', zorder=1)
+                self.spec_ax[r_ind].set_xlim(base_spec_xlim) # Keep original limits
+                
+                # Display information about selected wavelength range
+                if self.radio_show_details.isChecked():
+                    vline_ind = self.spec_vline_ind[r_ind]
+                    if vline_ind is None:
+                        vline_ind = 'N/A'
+                    info_text = [f"Selected wavelength:"
+                                +f"\nvalue: {self.spec_vline_val[r_ind]:.3f} [{vline_ind}]"]
+                    self.spec_ax[r_ind].text(0.02, 0.98, info_text[0], 
+                                            horizontalalignment='left',
+                                            verticalalignment='top',
+                                            transform=self.spec_ax[r_ind].transAxes)
 
             # Display location info
             # Note: we use the double prime symbols below (LaTeX looked odd)
@@ -1159,6 +1349,12 @@ class MainWindow(QtWidgets.QWidget):
             self.spec_ax[r_ind].figure.canvas.draw_idle() # Update the plot!
 
             self.spec_click[r_ind] = self.spec_fig[r_ind].canvas.mpl_connect('button_press_event', self.event_spec_click)
+            # self.spec_keyboard[r_ind] = self.spec_fig[r_ind].canvas.mpl_connect('key_press_event', self.event_keyboard_nav)
+
+            # Check if dialog box is open and update as needed
+            if self.lim_dialog is not None and self.lim_dialog.isVisible():
+                if self.dialog_r_ind == r_ind:
+                    self.lim_dialog.read_spec_limits(self) # Update spec limits
         else:
             # Plot an empty ax with a tip about selecting a point
             if self.spec_ax[r_ind] is None:
@@ -1172,15 +1368,67 @@ class MainWindow(QtWidgets.QWidget):
                             transform=empty_ax.transAxes)
                 self.spec_fig[r_ind].canvas.draw_idle()
 
+    def update_canvas_focus(self, r_ind=None):
+        """Update the focus of the limits dialog and active plot canvas"""
+        # Check if dialog box is open and update as needed
+        if self.lim_dialog is not None and self.lim_dialog.isVisible():
+            if r_ind is None or r_ind > self.curr_layout_ind:
+                # Skip if invalid or hidden index
+                pass
+            elif self.dialog_r_ind != r_ind:
+                self.button_rast_lims[r_ind].click() # Reopen with new focus
+
+        # Check if a figure is focused and update the frame as needed
+        focused_name = self.focusWidget().objectName()
+        if len(focused_name) <= 0: 
+            focused_name = getattr(self.focusWidget(), 'AltObjectName', 'none')
+
+        if focused_name.lower() != 'none' and focused_name.count('_') == 2:
+            rv, plot_type, obj_class = focused_name.split('_')
+        else:
+            rv, plot_type, obj_class = 'none', 'none', 'none'
+
+        if (self.focused_fig is not None 
+        and self.focused_fig.canvas != self.focusWidget()):
+            # Turn OFF border for a figure that has lost the keyboard focus
+            self.focused_fig.patch.set_linewidth(0)
+            self.focused_fig.patch.set_edgecolor(None)
+            self.focused_fig.canvas.draw_idle() # Update the plot!
+            if plot_type == 'rast':
+                self.focused_fig.canvas.mpl_disconnect(self.rast_keyboard[self.focused_r_ind])
+                self.rast_keyboard[self.focused_r_ind] = None
+            elif plot_type == 'spec':
+                self.focused_fig.canvas.mpl_disconnect(self.spec_keyboard[self.focused_r_ind])
+                self.spec_keyboard[self.focused_r_ind] = None
+            self.focused_r_ind = None
+            self.focused_type = None
+            self.focused_fig = None
+        
+        if obj_class.lower().startswith('canvas'):
+            # Turn ON border for a figure that has gained the keyboard focus
+            self.focused_r_ind = int(rv[1])
+            self.focused_type = plot_type
+            if plot_type == 'rast':
+                self.focused_fig = self.rast_fig[self.focused_r_ind]
+                self.rast_keyboard[self.focused_r_ind] = self.focused_fig.canvas.mpl_connect('key_press_event', self.event_keyboard_nav)
+            elif plot_type == 'spec':
+                self.focused_fig = self.spec_fig[self.focused_r_ind]
+                self.spec_keyboard[self.focused_r_ind] = self.focused_fig.canvas.mpl_connect('key_press_event', self.event_keyboard_nav)
+            self.focused_fig.patch.set_linewidth(5)
+            self.focused_fig.patch.set_edgecolor('black')
+            self.focused_fig.canvas.draw_idle() # Update the plot!
+
     def event_change_layout(self):
+        """Event for chaning the number of displayed image panels"""
         layout_index = self.box_layout.currentIndex()
         self.arange_layout(layout_index=layout_index)
 
     def event_select_file(self):
-        r_ind = int(self.sender().objectName()[1])
+        """Open file dialog for loading an image into a single selected panel"""
+        r_ind = int(self.sender().objectName()[1]) # Get r_ind of selected panel
         # QtWidgets.QApplication.processEvents() ## probably not needed....
         options = QtWidgets.QFileDialog.Options()
-        # options |= QtWidgets.QFileDialog.DontUseNativeDialog ## sometimes causes long delays
+        # options |= QtWidgets.QFileDialog.DontUseNativeDialog ## can cause long delays
 
         selected_file, _ = QtWidgets.QFileDialog.getOpenFileName(self, 
                                 f"Select a file to open in Panel #{r_ind+1}",
@@ -1190,9 +1438,10 @@ class MainWindow(QtWidgets.QWidget):
         self.load_file(selected_file, r_ind=r_ind)
 
     def event_open_all(self):
+        """Open file dialog for loading a single image into all panels"""
         # QtWidgets.QApplication.processEvents() ## probably not needed....
         options = QtWidgets.QFileDialog.Options()
-        # options |= QtWidgets.QFileDialog.DontUseNativeDialog ## sometimes causes long delays
+        # options |= QtWidgets.QFileDialog.DontUseNativeDialog ## can cause long delays
         selected_file, _ = QtWidgets.QFileDialog.getOpenFileName(self, 
                                 'Select a file to open in ALL panels',
                                 filter='eis_*.h5', options=options)
@@ -1200,38 +1449,56 @@ class MainWindow(QtWidgets.QWidget):
         self.load_file(selected_file, r_ind=0, load_in_all=True)
 
     def event_quick_select(self):
-        r_ind = int(self.sender().objectName()[1])
+        """Event for using dropdown list to quickly switch files in the same dir"""
+        r_ind = int(self.sender().objectName()[1]) # Get r_ind of selected panel
 
         curr_dir = self.selected_dir[r_ind]
         new_filename = self.box_file_list[r_ind].currentText()
         selected_file = os.path.join(curr_dir, new_filename)
 
         self.load_file(selected_file, r_ind=r_ind)
+        self.update_canvas_focus(r_ind=r_ind)
 
     def event_plot_raster(self, index):
-        r_ind = int(self.sender().objectName()[1])
+        """Event for plotting the main image of a selected panel"""
+        r_ind = int(self.sender().objectName()[1]) # Get r_ind of selected panel
         self.plot_raster(r_ind=r_ind)
+        self.update_canvas_focus(r_ind=r_ind)
+    
+    def event_replot_all_spec(self):
+        """Event for replotting all of the spectra"""
+        self.update_canvas_focus(r_ind=None)
+        for r in range(self.max_num_rasters):
+            self.plot_spectrum(r_ind=r)
 
     def event_reset_plot(self):
+        """Clear and replot a selected raster or spectrum"""
         r_ind = int(self.sender().objectName()[1])
         plot_type = self.sender().objectName().split('_')[1]
 
         if plot_type.lower().startswith('rast'):
+            self.rast_ax[r_ind] = None
             self.rast_fig[r_ind].clf()
             self.rast_lims[r_ind] = None
+            self.rast_auto_aspect[r_ind] = None
             self.plot_raster(r_ind=r_ind)
         elif plot_type.lower().startswith('spec'):
+            self.spec_ax[r_ind] = None
             self.spec_fig[r_ind].clf()
             self.spec_lims[r_ind] = None
             self.plot_spectrum(r_ind=r_ind)
 
+        self.update_canvas_focus(r_ind=r_ind)
+
     def event_rast_click(self, event):
+        """Event for clicks on a raster image"""
         # First, figure out which raster canvas was clicked on
         for r in range(self.max_num_rasters):
             if self.rast_canvas[r] == event.canvas:
                 r_ind = r
                 break
 
+        self.update_canvas_focus(r_ind=r_ind)
         if event.button is MouseButton.MIDDLE:
             # Toggle pan/zoom on middle click
             self.rast_nav[r_ind].pan()
@@ -1246,11 +1513,26 @@ class MainWindow(QtWidgets.QWidget):
             xdata, ydata = event.xdata, event.ydata # X, Y in data coords [arcsec]
 
             if self.radio_sync_cross.isChecked():
+                # If CCD mode of CLICKED rast is ON, 
+                # AND sync vline is checked, fake a click on the spectrum
+                if (str(self.display_mode[r_ind]).lower().endswith('ccd')
+                and self.radio_sync_vline.isChecked()
+                and self.spec_ax[r_ind] is not None):
+                    class FakeClickEvent():
+                        pass
+
+                    # Setup the fake event
+                    fake_click = FakeClickEvent()
+                    fake_click.canvas = self.spec_canvas[r_ind]
+                    fake_click.button = None
+                    fake_click.xdata = copy.copy(xdata)
+                    fake_click.ydata = copy.copy(ydata)
+                    self.event_spec_click(fake_click)
+
                 # Update ALL crosshairs and spectra
                 for r in range(self.max_num_rasters):
-
-                    # If CCD mode of CLICKED rast is ON, use this rast OLD x_coord
                     copy_xdata = xdata
+                    # If CCD mode of CLICKED rast is ON, use THIS rast OLD x_coord
                     if str(self.display_mode[r_ind]).lower().endswith('ccd'):
                         if self.crosshair_old_coords[r] is not None:
                             copy_xdata = self.crosshair_old_coords[r][0]
@@ -1261,7 +1543,8 @@ class MainWindow(QtWidgets.QWidget):
                     if str(self.display_mode[r]).lower().endswith('ccd'):
                         # Check timestamp and CCD mode of CLICKED rast
                         if str(self.display_mode[r_ind]).lower().endswith('ccd'):
-                            pass # skip if the CLICKED rast is CCD mode
+                            # Only need to update spec_vline (not raster img)
+                            self.spec_vline_val[r] = xdata
                         elif (self.file_date_obs[r] is not None 
                         and self.file_date_obs[r] == str(self.file_date_obs[r_ind])):
                             # If CLICKED rast is NOT in CCD mode,
@@ -1275,15 +1558,20 @@ class MainWindow(QtWidgets.QWidget):
             else:
                 # Only update the crosshair and spectrum for the canvas clicked
                 self.crosshair_new_coords[r_ind] = [xdata, ydata]
+                # If CCD mode is ON, make sure to still plot the spec vline
+                if str(self.display_mode[r_ind]).lower().endswith('ccd'):
+                    self.spec_vline_val[r_ind] = xdata
                 self.plot_crosshair(r_ind=r_ind)
 
     def event_spec_click(self, event):
+        """Event for clicks on a spectrum"""
         # First, figure out which spec canvas was clicked on
         for r in range(self.max_num_rasters):
             if self.spec_canvas[r] == event.canvas:
                 r_ind = r
                 break
         
+        self.update_canvas_focus(r_ind=r_ind)
         if event.button is MouseButton.MIDDLE:
             # Toggle pan/zoom on middle click
             self.spec_nav[r_ind].pan()
@@ -1298,31 +1586,112 @@ class MainWindow(QtWidgets.QWidget):
             xdata = event.xdata # X in data coords [Angstrom]
 
             if self.radio_sync_vline.isChecked():
-                # Update ALL rasters and spectra (if covering same wavelength)
+                # Update ALL spectra and rasters (if covering same wavelength)
                 for r in range(self.max_num_rasters):
                     if self.rast_wcoords[r] is None:
                         continue
                     elif (xdata > self.rast_wcoords[r][0] 
                     and xdata < self.rast_wcoords[r][-1]): 
                         self.spec_vline_val[r] = xdata
-                        self.plot_raster(r_ind=r)
+                        if self.display_mode[r].lower().endswith('ccd'):
+                            # If CCD mode is ON, only update crosshair and spec
+                            self.plot_crosshair(r_ind=r)
+                        else:
+                            # Update raster too
+                            self.plot_raster(r_ind=r)
             else:
-                # Only update the raster and spectrum for the canvas clicked
+                # Only update the spectrum and/or raster for the canvas clicked
                 self.spec_vline_val[r_ind] = xdata
-                self.plot_raster(r_ind=r_ind)
+                if self.display_mode[r_ind].lower().endswith('ccd'):
+                    # If CCD mode is ON, only update crosshair and spec
+                    self.plot_crosshair(r_ind=r_ind)
+                else:
+                    # Update raster too
+                    self.plot_raster(r_ind=r_ind)
 
-    def event_replot_all_spec(self):
-        for r in range(self.max_num_rasters):
-            self.plot_spectrum(r_ind=r)
+    def event_keyboard_nav(self, event):
+        """Event for moving crosshair or vline with the keyboard"""
+        r_ind = self.focused_r_ind
+        plot_type = self.focused_type
+
+        if r_ind > self.curr_layout_ind:
+            # Just ignore if active canvas is hidden
+            return
+        elif event.key.split('+')[-1] not in ['left', 'right', 'up', 'down']:
+            # Ignore non-arrow keys
+            return
+
+        # Setup a fake click object to send the the focused canvas
+        class FakeClickEvent():
+            pass
+
+        fake_click = FakeClickEvent()
+        fake_click.canvas = self.focused_fig.canvas
+        fake_click.button = None
+        
+        arrow_dir = event.key.split('+')[-1]
+        mod_key = event.key.split('+')[0] # e.g. "shift" or "ctrl" (if any)
+        num_steps = 1
+        if mod_key == 'shift':
+            num_steps = 5
+        elif mod_key == 'ctrl':
+            num_steps = 10
+
+        if plot_type == 'rast':
+            if self.rast_crosshair[r_ind] is None:
+                return
+            # Get current crosshair coords
+            old_xval, old_yval = self.rast_crosshair[r_ind].get_offsets().data[0]
+            shift_x, shift_y = 0.0, 0.0
+            if arrow_dir == 'left':
+                shift_x = -num_steps*self.rast_xydelta[r_ind][0]
+            elif arrow_dir == 'right':
+                shift_x = num_steps*self.rast_xydelta[r_ind][0]
+            elif arrow_dir == 'up':
+                shift_y = num_steps*self.rast_xydelta[r_ind][1]
+            elif arrow_dir == 'down':
+                shift_y = -num_steps*self.rast_xydelta[r_ind][1]
+            fake_click.xdata = old_xval + shift_x
+            fake_click.ydata = old_yval + shift_y
+            self.event_rast_click(fake_click)
+        elif plot_type == 'spec':
+            if self.spec_vline_val[r_ind] is None:
+                return
+            # Get current crosshair coords
+            old_xval, old_yval = self.spec_vline_val[r_ind], 0.0
+            shift_x, shift_y = 0.0, 0.0
+            if arrow_dir == 'left':
+                shift_x = -num_steps*self.spec_xydelta[r_ind][0]
+            elif arrow_dir == 'right':
+                shift_x = num_steps*self.spec_xydelta[r_ind][0]
+            fake_click.xdata = old_xval + shift_x
+            fake_click.ydata = old_yval
+            self.event_spec_click(fake_click)
+
+    def event_lim_dialog(self, event):
+        """Event for opening the dialog box for viewing / setting raster limits"""
+        r_ind = int(self.sender().objectName()[1]) # Get r_ind of selected panel
+        self.dialog_r_ind = r_ind
+
+        old_geometry = None
+        if self.lim_dialog is not None:
+            dialog_is_vis = self.lim_dialog.isVisible()
+            if dialog_is_vis:
+                old_geometry = self.lim_dialog.geometry()
+            self.lim_dialog.close()
+        self.lim_dialog = LimitsDialog(self, old_geometry=old_geometry)
+        self.lim_dialog.show()
+        self.update_canvas_focus(r_ind=None)
 
     def event_quit(self):
-        # --- quit the app
+        """Close all figures, clean-up GUI objects, and quit the app"""
         for r in range(self.max_num_rasters):
             if self.rast_img[r] is not None:
                 self.rast_img[r].figure.canvas.mpl_disconnect(self.rast_click[r])
+                self.rast_img[r].figure.canvas.mpl_disconnect(self.rast_keyboard[r])
             if self.spec_fig[r] is not None:
                 self.spec_fig[r].canvas.mpl_disconnect(self.spec_click[r])
-            self.label_filepath[r].close()
+                self.spec_fig[r].canvas.mpl_disconnect(self.spec_keyboard[r])
             self.button_select[r].close()
             self.box_line_id[r].close()
             self.box_var[r].close()
@@ -1332,9 +1701,585 @@ class MainWindow(QtWidgets.QWidget):
             self.button_reset_spec[r].close()
             self.spec_nav[r].close()
             self.spec_canvas[r].close()
+        if self.lim_dialog is not None:
+            self.lim_dialog.close()
         QtWidgets.QApplication.instance().quit()
         self.close()
 
+    def closeEvent(self, event):
+        """Override the close event when the "X" button on the window is clicked"""
+        self.event_quit()
+
+#@dialog########################################################################
+# DIALOG BOX FOR SETTING LIMITS AND CROSSHAIR COORDINATES ######################
+################################################################################
+class LimitsDialog(QtWidgets.QDialog):
+    """Make a cutom dialog box for viewing and setting plot limits"""
+    def __init__(self, parent=None, old_geometry=None):
+        super().__init__(parent)
+
+        curr_r_ind = parent.dialog_r_ind
+        curr_filename = parent.selected_file[curr_r_ind]
+        curr_xaxis_type = str(parent.rast_xaxis_type[curr_r_ind])
+        self.setWindowTitle(f"Set Limits / Crosshair")
+        self.grid = QtWidgets.QGridLayout(self)
+
+        self.curr_xlim = [None, None]
+        self.curr_ylim = [None, None]
+        self.curr_cross = [None, None]
+        
+        self.edit_xlim = [None, None] # QLineEdit objects
+        self.edit_ylim = [None, None]
+        self.edit_cross = [None, None]
+        self.edit_spec_xlim = [None, None]
+        self.edit_spec_ylim = [None, None]
+        self.edit_vline = None
+
+        label_panel = QtWidgets.QLabel(self)
+        label_panel.setText(f"Panel {curr_r_ind+1}   :   {curr_filename}")
+        label_panel.setFont(parent.font_default_bold)
+
+        label_limits = QtWidgets.QLabel(self)
+        label_limits.setText('Image')
+        label_limits.setFont(parent.font_default_bold)
+
+        label_min = QtWidgets.QLabel(self)
+        label_min.setText('     Min')
+        label_min.setFont(parent.font_default)
+
+        label_max = QtWidgets.QLabel(self)
+        label_max.setText('     Max')
+        label_max.setFont(parent.font_default)
+
+        self.label_xaxis = QtWidgets.QLabel(self)
+        self.label_xaxis.setText(curr_xaxis_type)
+        self.label_xaxis.setFont(parent.font_default)
+
+        label_yaxis = QtWidgets.QLabel(self)
+        label_yaxis.setText('Solar-Y')
+        label_yaxis.setFont(parent.font_default)
+
+        grid_spacer_1 = QtWidgets.QLabel(self)
+        grid_spacer_1.setText('')
+        grid_spacer_1.setFont(parent.font_default)
+
+        label_cross = QtWidgets.QLabel(self)
+        label_cross.setText('Crosshair')
+        label_cross.setFont(parent.font_default_bold)
+
+        label_coords = QtWidgets.QLabel(self)
+        label_coords.setText('     Values')
+        label_coords.setFont(parent.font_default)
+
+        label_xcc = QtWidgets.QLabel(self)
+        label_xcc.setText(curr_xaxis_type)
+        label_xcc.setFont(parent.font_default)
+
+        label_ycc = QtWidgets.QLabel(self)
+        label_ycc.setText('Solar-Y')
+        label_ycc.setFont(parent.font_default)
+
+        self.label_c_var = QtWidgets.QLabel(self)
+        self.label_c_var.setText('Img Var')
+        self.label_c_var.setFont(parent.font_default)
+
+        self.cross_val = QtWidgets.QLabel(self)
+        self.cross_val.setText('')
+        self.cross_val.setFont(parent.font_small)
+
+        grid_spacer_2 = QtWidgets.QLabel(self)
+        grid_spacer_2.setText('')
+        grid_spacer_2.setFont(parent.font_default)
+
+        label_spec = QtWidgets.QLabel(self)
+        label_spec.setText('Spectrum')
+        label_spec.setFont(parent.font_default_bold)
+
+        label_spec_min = QtWidgets.QLabel(self)
+        label_spec_min.setText('     Min')
+        label_spec_min.setFont(parent.font_default)
+
+        label_spec_max = QtWidgets.QLabel(self)
+        label_spec_max.setText('     Max')
+        label_spec_max.setFont(parent.font_default)
+
+        label_spec_xax = QtWidgets.QLabel(self)
+        label_spec_xax.setText('Wavelength')
+        label_spec_xax.setFont(parent.font_default)
+
+        label_spec_yax = QtWidgets.QLabel(self)
+        label_spec_yax.setText('Intensity')
+        label_spec_yax.setFont(parent.font_default)
+
+        label_vline = QtWidgets.QLabel(self)
+        label_vline.setText('vline')
+        label_vline.setFont(parent.font_default)
+
+        grid_spacer_bot = QtWidgets.QLabel(self)
+        grid_spacer_bot.setText('')
+        grid_spacer_bot.setFont(parent.font_default)
+        grid_spacer_bot.setMinimumWidth(int(0.5*parent.base_width))
+
+        # Create all of the buttons
+        self.button_ok = QtWidgets.QPushButton(f'OK')
+        self.button_ok.setFont(parent.font_default)
+        self.button_ok.setFixedWidth(parent.base_width)
+        self.button_ok.clicked.connect(lambda: self.event_apply_everything(parent, close=True))
+
+        self.button_cancel = QtWidgets.QPushButton(f'Cancel')
+        self.button_cancel.setFont(parent.font_default)
+        self.button_cancel.setFixedWidth(parent.base_width)
+        self.button_cancel.clicked.connect(lambda: self.event_close(parent))
+
+        self.button_apply = QtWidgets.QPushButton(f'Apply')
+        self.button_apply.setFont(parent.font_default)
+        self.button_apply.setFixedWidth(parent.base_width)
+        self.button_apply.clicked.connect(lambda: self.event_apply_everything(parent))
+
+        self.button_apply_all = QtWidgets.QPushButton(f'Apply ALL')
+        self.button_apply_all.setFont(parent.font_default)
+        self.button_apply_all.setFixedWidth(parent.base_width)
+        self.button_apply_all.clicked.connect(lambda: self.event_apply_everything(parent, apply_all=True))
+
+        self.button_set_lims = QtWidgets.QPushButton(f'Set')
+        self.button_set_lims.setFont(parent.font_small)
+        self.button_set_lims.setFixedWidth(parent.base_width)
+        self.button_set_lims.clicked.connect(lambda: self.event_set_rast_lims(parent))
+
+        self.button_set_all_lims = QtWidgets.QPushButton(f'Set ALL')
+        self.button_set_all_lims.setFont(parent.font_small)
+        self.button_set_all_lims.setFixedWidth(parent.base_width)
+        self.button_set_all_lims.clicked.connect(lambda: self.event_set_rast_lims(parent, set_all=True))
+
+        self.button_set_cross = QtWidgets.QPushButton(f'Set')
+        self.button_set_cross.setFont(parent.font_small)
+        self.button_set_cross.setFixedWidth(parent.base_width)
+        self.button_set_cross.clicked.connect(lambda: self.event_set_crosshair(parent))
+
+        self.button_set_all_cross = QtWidgets.QPushButton(f'Set ALL')
+        self.button_set_all_cross.setFont(parent.font_small)
+        self.button_set_all_cross.setFixedWidth(parent.base_width)
+        self.button_set_all_cross.clicked.connect(lambda: self.event_set_crosshair(parent, set_all=True))
+
+        self.button_set_spec = QtWidgets.QPushButton(f'Set')
+        self.button_set_spec.setFont(parent.font_small)
+        self.button_set_spec.setFixedWidth(parent.base_width)
+        self.button_set_spec.clicked.connect(lambda: self.event_set_spec(parent))
+
+        self.button_set_all_spec = QtWidgets.QPushButton(f'Set ALL')
+        self.button_set_all_spec.setFont(parent.font_small)
+        self.button_set_all_spec.setFixedWidth(parent.base_width)
+        self.button_set_all_spec.clicked.connect(lambda: self.event_set_spec(parent, set_all=True))
+
+        # Create the textbox widgets (Note: creation order sets TAB order)
+        for L in range(2):
+            self.edit_xlim[L] = QtWidgets.QLineEdit(self)
+            self.edit_xlim[L].setFixedWidth(parent.base_width)
+            self.edit_xlim[L].setText("")
+            self.edit_xlim[L].setFont(parent.font_small)
+            num_validator = QtGui.QDoubleValidator(-20000.0, 20000.0, 4, notation=1, 
+                                                   parent=self.edit_xlim[L])
+            self.edit_xlim[L].setValidator(num_validator)
+        
+        for L in range(2):
+            self.edit_ylim[L] = QtWidgets.QLineEdit(self)
+            self.edit_ylim[L].setFixedWidth(parent.base_width)
+            self.edit_ylim[L].setText("")
+            self.edit_ylim[L].setFont(parent.font_small)
+            num_validator = QtGui.QDoubleValidator(-20000.0, 20000.0, 4, notation=1, 
+                                                   parent=self.edit_ylim[L])
+            self.edit_ylim[L].setValidator(num_validator)
+
+        for L in range(2):
+            self.edit_cross[L] = QtWidgets.QLineEdit(self)
+            # self.edit_cross[L].setFixedWidth(2*parent.base_width+5)
+            self.edit_cross[L].setText("")
+            self.edit_cross[L].setFont(parent.font_small)
+            num_validator = QtGui.QDoubleValidator(-20000.0, 20000.0, 4, notation=1, 
+                                                   parent=self.edit_cross[L])
+            self.edit_cross[L].setValidator(num_validator)
+
+        for L in range(2):
+            self.edit_spec_xlim[L] = QtWidgets.QLineEdit(self)
+            self.edit_spec_xlim[L].setFixedWidth(parent.base_width)
+            self.edit_spec_xlim[L].setText("")
+            self.edit_spec_xlim[L].setFont(parent.font_small)
+            num_validator = QtGui.QDoubleValidator(-20000.0, 20000.0, 4, notation=1, 
+                                                   parent=self.edit_spec_xlim[L])
+            self.edit_spec_xlim[L].setValidator(num_validator)
+        
+        for L in range(2):
+            self.edit_spec_ylim[L] = QtWidgets.QLineEdit(self)
+            self.edit_spec_ylim[L].setFixedWidth(parent.base_width)
+            self.edit_spec_ylim[L].setText("")
+            self.edit_spec_ylim[L].setFont(parent.font_small)
+            num_validator = QtGui.QDoubleValidator(-20000.0, 20000.0, 4, notation=1, 
+                                                   parent=self.edit_spec_ylim[L])
+            self.edit_spec_ylim[L].setValidator(num_validator)
+
+        self.edit_vline = QtWidgets.QLineEdit(self)
+        self.edit_vline.setText("")
+        self.edit_vline.setFont(parent.font_small)
+        num_validator = QtGui.QDoubleValidator(-20000.0, 20000.0, 4, notation=1, 
+                                                parent=self.edit_vline)
+        self.edit_vline.setValidator(num_validator)
+
+        # Arange the widgets
+        self.grid.addWidget(label_panel, 0, 0, 1, 5)
+        
+        self.grid.addWidget(label_limits, 1, 0)
+        self.grid.addWidget(label_min, 1, 1)
+        self.grid.addWidget(label_max, 1, 2)
+        self.grid.addWidget(self.label_xaxis, 2, 0)
+        self.grid.addWidget(self.edit_xlim[0], 2, 1)
+        self.grid.addWidget(self.edit_xlim[1], 2, 2)
+        self.grid.addWidget(label_yaxis, 3, 0)
+        self.grid.addWidget(self.edit_ylim[0], 3, 1)
+        self.grid.addWidget(self.edit_ylim[1], 3, 2)
+        
+        self.grid.addWidget(grid_spacer_1, 4, 0)
+        self.grid.addWidget(label_cross, 5, 0)
+        self.grid.addWidget(label_coords, 5, 1)
+        self.grid.addWidget(label_xcc, 6, 0)
+        self.grid.addWidget(self.edit_cross[0], 6, 1, 1, 2)
+        self.grid.addWidget(label_ycc, 7, 0)
+        self.grid.addWidget(self.edit_cross[1], 7, 1, 1, 2)
+        self.grid.addWidget(self.label_c_var, 8, 0)
+        self.grid.addWidget(self.cross_val, 8, 1, 1, 2)
+
+        self.grid.addWidget(grid_spacer_2, 9, 0)
+        self.grid.addWidget(label_spec, 10, 0)
+        self.grid.addWidget(label_spec_min, 10, 1)
+        self.grid.addWidget(label_spec_max, 10, 2)
+        self.grid.addWidget(label_spec_xax, 11, 0)
+        self.grid.addWidget(self.edit_spec_xlim[0], 11, 1)
+        self.grid.addWidget(self.edit_spec_xlim[1], 11, 2)
+        self.grid.addWidget(label_spec_yax, 12, 0)
+        self.grid.addWidget(self.edit_spec_ylim[0], 12, 1)
+        self.grid.addWidget(self.edit_spec_ylim[1], 12, 2)
+        self.grid.addWidget(label_vline, 13, 0)
+        self.grid.addWidget(self.edit_vline, 13, 1, 1, 2)
+
+        # Note: The first button ADDED (not created) is the default for "enter"
+        self.grid.addWidget(grid_spacer_bot, 14, 3)
+        self.grid.addWidget(self.button_ok, 15, 0)
+        self.grid.addWidget(self.button_cancel, 15, 1)
+        self.grid.addWidget(self.button_apply, 15, 2)
+        self.grid.addWidget(self.button_apply_all, 15, 4)
+
+        self.grid.addWidget(self.button_set_lims, 2, 4)
+        self.grid.addWidget(self.button_set_all_lims, 3, 4)
+
+        self.grid.addWidget(self.button_set_cross, 6, 4)
+        self.grid.addWidget(self.button_set_all_cross, 7, 4)
+
+        self.grid.addWidget(self.button_set_spec, 11, 4)
+        self.grid.addWidget(self.button_set_all_spec, 12, 4)
+
+        self.setLayout(self.grid)
+        self.read_rast_limits(parent)
+        self.read_rast_crosshair(parent)
+        self.read_spec_limits(parent)
+        if old_geometry is not None:
+            self.setGeometry(old_geometry) # Keep previous on-screen location
+
+    def read_rast_limits(self, parent):
+        """Get the raster limits at the time this dialog is opened"""
+        r_ind = parent.dialog_r_ind
+        if parent.rast_ax[r_ind] is not None:
+            # Set the X-axis label
+            curr_xaxis_type = str(parent.rast_xaxis_type[r_ind])
+            self.label_xaxis.setText(curr_xaxis_type)
+
+            # Get current ax limits              
+            self.curr_xlim = parent.rast_ax[r_ind].get_xlim()
+            self.curr_ylim = parent.rast_ax[r_ind].get_ylim()
+
+            # Set text boxes with the values (with rounding)
+            for L in range(2):
+                self.edit_xlim[L].setText(str(round(self.curr_xlim[L], 4)))
+                self.edit_ylim[L].setText(str(round(self.curr_ylim[L], 4)))
+        
+    def read_rast_crosshair(self, parent):
+        """Get the crosshair coords at the time this dialog is opened"""
+        r_ind = parent.dialog_r_ind
+        curr_img_var = str(parent.var_label[r_ind])
+        self.label_c_var.setText(curr_img_var.split('_')[0])
+        var_val = ''
+        if parent.rast_crosshair[r_ind] is not None:
+            # Get current crosshair coords
+            self.curr_cross = parent.rast_crosshair[r_ind].get_offsets().data[0]
+            var_val = str(round(parent.crosshair_val[r_ind], 2))
+
+            # Set text boxes with the values (with rounding)
+            self.edit_cross[0].setText(str(round(self.curr_cross[0], 4)))
+            self.edit_cross[1].setText(str(round(self.curr_cross[1], 4)))
+        self.cross_val.setText(var_val)
+
+    def read_spec_limits(self, parent):
+        """Get the spec lims and vline at the time this dialog is opened"""
+        r_ind = parent.dialog_r_ind
+        if parent.spec_ax[r_ind] is not None:
+
+            # Get current ax limits              
+            curr_spec_xlim = parent.spec_ax[r_ind].get_xlim()
+            curr_spec_ylim = parent.spec_ax[r_ind].get_ylim()
+
+            # Set text boxes with the values (with rounding)
+            for L in range(2):
+                self.edit_spec_xlim[L].setText(str(round(curr_spec_xlim[L], 4)))
+                self.edit_spec_ylim[L].setText(str(round(curr_spec_ylim[L], 4)))
+
+            # Get current vline value and update the text box
+            if parent.spec_vline_val[r_ind] is not None:
+                curr_vline = parent.spec_vline_val[r_ind]
+                self.edit_vline.setText(str(round(curr_vline, 4)))
+
+    def event_set_rast_lims(self, parent, set_all=False):
+        """Apply the input limits to the selected plots"""
+        # Reading values from the text boxes and convert to floats (if able)
+        new_xlim = [None, None]
+        new_ylim = [None, None]
+        for L in range(2):
+            try:
+                new_xlim[L] = float(self.edit_xlim[L].text())
+            except:
+                new_xlim[L] = None
+            try:
+                new_ylim[L] = float(self.edit_ylim[L].text())
+            except:
+                new_ylim[L] = None
+        
+        # Set list of plot indices to apply the limits to
+        if set_all:
+            r_ind_list = [ri for ri in range(parent.max_num_rasters)]
+        else:
+            r_ind_list = [parent.dialog_r_ind]
+        
+        # Validate and set the limits
+        coord_buffer = 5
+        aspect_buffer = 0.008
+        source_xaxis_type = parent.rast_xaxis_type[parent.dialog_r_ind]
+        for RI in r_ind_list:
+            # Skip empty or hidden images
+            if parent.rast_ax[RI] is not None and RI <= parent.curr_layout_ind:
+                this_xaxis_type = parent.rast_xaxis_type[RI]
+                this_new_xlim = new_xlim.copy()
+                this_new_ylim = new_ylim.copy()
+                this_curr_xlim = parent.rast_ax[RI].get_xlim()
+                this_curr_ylim = parent.rast_ax[RI].get_ylim()
+                this_ax_xrange = parent.rast_xcoords[RI][[0,-1]]
+                this_ax_yrange = parent.rast_ycoords[RI][[0,-1]]
+
+                # Replace "None" with min or max data values
+                for V in range(2):
+                    if this_new_xlim[V] is None:
+                        this_new_xlim[V] = this_ax_xrange[V]
+                    if this_new_ylim[V] is None:
+                        this_new_ylim[V] = this_ax_yrange[V]
+                
+                # Check to see if these are "reasonable" limits for this plot
+                # Note: will skip shifting if both limits are nearly unchanged
+                go_change_xlim = False
+                if ((this_new_xlim[0] < this_ax_xrange[1]) 
+                and (this_new_xlim[1] > this_ax_xrange[0])
+                and ((np.abs(this_new_xlim[0] - this_curr_xlim[0]) >= coord_buffer)
+                    or (np.abs(this_new_xlim[1] - this_curr_xlim[1]) >= coord_buffer))
+                and this_xaxis_type == source_xaxis_type):
+                    # Also only change plots with the same x-axis type
+                    go_change_xlim = True
+                
+                go_change_ylim = False
+                if ((this_new_ylim[0] < this_ax_yrange[1]) 
+                and (this_new_ylim[1] > this_ax_yrange[0])
+                and ((np.abs(this_new_ylim[0] - this_curr_ylim[0]) >= coord_buffer)
+                    or (np.abs(this_new_ylim[1] - this_curr_ylim[1]) >= coord_buffer))):
+                    go_change_ylim = True
+
+                # Actually apply the changes
+                if go_change_xlim or go_change_ylim:
+                    # Check aspect ratio
+                    base_aspect_ratio = np.diff(this_ax_xrange)/np.diff(this_ax_yrange)
+                    new_aspect_ratio = np.diff(this_new_xlim)/np.diff(this_new_ylim)
+
+                    use_auto_aspect = True
+                    if np.abs(base_aspect_ratio - new_aspect_ratio) < aspect_buffer:
+                        use_auto_aspect = False
+
+                    if use_auto_aspect:
+                        # Enables non-square pixels
+                        parent.rast_ax[RI].set_aspect('auto') 
+                        parent.rast_auto_aspect[RI] = True
+
+                    if go_change_xlim:
+                        parent.rast_ax[RI].set_xlim(this_new_xlim)
+                    if go_change_ylim:
+                        parent.rast_ax[RI].set_ylim(this_new_ylim)
+                    parent.rast_img[RI].figure.canvas.draw_idle() # Update the plot!
+                    self.read_rast_limits(parent) # update the display of limits
+
+    def event_set_crosshair(self, parent, set_all=False):
+        """Move the crosshair location to the input coordinates"""
+        new_cross = [None, None]
+        for L in range(2):
+            try:
+                new_cross[L] = float(self.edit_cross[L].text())
+            except:
+                new_cross[L] = None
+
+        r_ind = parent.dialog_r_ind
+        if parent.rast_ax[r_ind] is None or r_ind > parent.curr_layout_ind:
+            # Skip if the raster is empty or hidden
+            pass
+        else: 
+            # "Easy" way, fake a click on the selected raster
+            class FakeClickEvent():
+                pass
+
+            # Setup the fake event
+            fake_click = FakeClickEvent()
+            fake_click.canvas = parent.rast_canvas[r_ind]
+            fake_click.button = None
+            fake_click.xdata = new_cross[0]
+            fake_click.ydata = new_cross[1]
+
+            # Send the fake click (while preserving state of crosshair sync)
+            prev_sync_cross_check = parent.radio_sync_cross.isChecked()
+            if set_all:
+                # Change ALL crosshairs (if valid)
+                parent.radio_sync_cross.setChecked(True)
+            else:
+                # Only change selected panel
+                parent.radio_sync_cross.setChecked(False)
+            parent.event_rast_click(fake_click)
+            parent.radio_sync_cross.setChecked(prev_sync_cross_check)
+
+    def event_set_spec(self, parent, set_all=False):
+        """Set the limits and vline in the selcted spectrum"""
+        # Reading values from the text boxes and convert to floats (if able)
+        new_spec_xlim = [None, None]
+        new_spec_ylim = [None, None]
+        for L in range(2):
+            try:
+                new_spec_xlim[L] = float(self.edit_spec_xlim[L].text())
+            except:
+                new_spec_xlim[L] = None
+            try:
+                new_spec_ylim[L] = float(self.edit_spec_ylim[L].text())
+            except:
+                new_spec_ylim[L] = None
+        
+        # Set list of plot indices to apply the limits to
+        if set_all:
+            r_ind_list = [ri for ri in range(parent.max_num_rasters)]
+        else:
+            r_ind_list = [parent.dialog_r_ind]
+        
+        # Validate and set the limits
+        coord_buffer = 0.05
+        for RI in r_ind_list:
+            # Skip empty or hidden images
+            if parent.spec_ax[RI] is not None and RI <= parent.curr_layout_ind:
+                this_new_xlim = new_spec_xlim.copy()
+                this_new_ylim = new_spec_ylim.copy()
+                this_curr_xlim = parent.spec_ax[RI].get_xlim()
+                this_curr_ylim = parent.spec_ax[RI].get_ylim()
+
+                # Get max and min data values current in plot
+                line_data = parent.spec_ax[RI].lines[0].get_data()
+                this_ax_xrange = [np.amin(line_data[0])-0.03, np.amax(line_data[0])+0.03]
+                this_ax_yrange = [np.amin(line_data[1])-10, np.amax(line_data[1])+10]
+
+                # Replace "None" with min or max data values
+                for V in range(2):
+                    if this_new_xlim[V] is None:
+                        this_new_xlim[V] = this_ax_xrange[V]
+                    if this_new_ylim[V] is None:
+                        this_new_ylim[V] = this_ax_yrange[V]
+                
+                # Check to see if these are "reasonable" limits for this plot
+                # Note: will skip shifting if both limits are nearly unchanged
+                go_change_xlim = False
+                if ((this_new_xlim[0] < this_ax_xrange[1]) 
+                and (this_new_xlim[1] > this_ax_xrange[0])
+                and ((np.abs(this_new_xlim[0] - this_curr_xlim[0]) >= coord_buffer)
+                    or (np.abs(this_new_xlim[1] - this_curr_xlim[1]) >= coord_buffer))):
+                    go_change_xlim = True
+                
+                go_change_ylim = False
+                if ((this_new_ylim[0] < this_ax_yrange[1]) 
+                and (this_new_ylim[1] > this_ax_yrange[0])
+                and ((np.abs(this_new_ylim[0] - this_curr_ylim[0]) >= coord_buffer)
+                    or (np.abs(this_new_ylim[1] - this_curr_ylim[1]) >= coord_buffer))):
+                    go_change_ylim = True
+
+                # Actually apply the changes
+                if go_change_xlim or go_change_ylim:
+                    if go_change_xlim:
+                        parent.spec_ax[RI].set_xlim(this_new_xlim)
+                    if go_change_ylim:
+                        parent.spec_ax[RI].set_ylim(this_new_ylim)
+                    parent.spec_ax[RI].figure.canvas.draw_idle() # Update the plot! # Update the plot!
+                    self.read_spec_limits(parent) # update the display of limits
+
+        # Read the vline value
+        try:
+            new_vline = float(self.edit_vline.text())
+        except:
+            new_vline = None
+
+        # Set the new vline by faking a click on the spectrum
+        r_ind = parent.dialog_r_ind
+        if parent.spec_ax[r_ind] is None or r_ind > parent.curr_layout_ind:
+            # Skip if the spectrum is empty or hidden
+            pass
+        else: 
+            # "Easy" way, fake a click on the selected raster
+            class FakeClickEvent():
+                pass
+
+            # Setup the fake event
+            fake_click = FakeClickEvent()
+            fake_click.canvas = parent.spec_canvas[r_ind]
+            fake_click.button = None
+            fake_click.xdata = new_vline
+            fake_click.ydata = 111.111
+
+            # Send the fake click (while preserving state of crosshair sync)
+            prev_sync_vline_check = parent.radio_sync_vline.isChecked()
+            if set_all:
+                # Change ALL crosshairs (if valid)
+                parent.radio_sync_vline.setChecked(True)
+            else:
+                # Only change selected panel
+                parent.radio_sync_vline.setChecked(False)
+            parent.event_spec_click(fake_click)
+            parent.radio_sync_vline.setChecked(prev_sync_vline_check)
+
+    def event_apply_everything(self, parent, close=False, apply_all=False):
+        """Event for buttons at the bottom that apply ALL changes"""
+        
+        self.event_set_rast_lims(parent, set_all=apply_all)
+        self.event_set_crosshair(parent, set_all=apply_all)
+        self.event_set_spec(parent, set_all=apply_all)
+
+        if close:
+            # Close the dialog after setting the limits (use by "OK" button)
+            self.event_close(parent)
+
+    def event_close(self, parent):
+        """Just close the dialog without changing anything"""
+        if parent is not None and 'dialog_r_ind' in parent.__dict__:
+            parent.dialog_r_ind = None
+        self.close()
+
+    def closeEvent(self, event):
+        """Override the close event when the "X" button on the window is clicked"""
+        self.event_close(None)
+
+#@main##########################################################################
+# MAIN FUNCTION CALLED WHEN INVOKED ############################################
+################################################################################
 def eis_explore_raster():
     # check the input
     if len(sys.argv) > 1:
