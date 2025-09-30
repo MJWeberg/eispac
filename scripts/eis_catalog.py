@@ -456,17 +456,29 @@ class Top(QtWidgets.QWidget):
         primary_key = str(self.primary_box.currentText())
         primary_value = str(self.primary_text.text())
 
-        if self.criteria[primary_key] == 'date_obs':
-            self.d.search(date=[start_time, end_time], noreturn=True)
-        elif primary_key.lower().startswith('trigger'):
-            # EIS triggered studies (1=XRT flare, 3=EIS flare, 4=EIS BP)
-            search_kwargs = {'date':[start_time, end_time]}
-            search_kwargs['tl_id'] = ['1', '3', '4']
-            self.d.search(**search_kwargs, noreturn=True)
-        else:
-            search_kwargs = {'date':[start_time, end_time]}
-            search_kwargs[self.criteria[primary_key]] = primary_value
-            self.d.search(**search_kwargs, noreturn=True)
+        try:
+            if self.criteria[primary_key] == 'date_obs':
+                self.d.search(date=[start_time, end_time], noreturn=True)
+            elif primary_key.lower().startswith('trigger'):
+                # EIS triggered studies (1=XRT flare, 3=EIS flare, 4=EIS BP)
+                search_kwargs = {'date':[start_time, end_time]}
+                search_kwargs['tl_id'] = ['1', '3', '4']
+                self.d.search(**search_kwargs, noreturn=True)
+            else:
+                search_kwargs = {'date':[start_time, end_time]}
+                search_kwargs[self.criteria[primary_key]] = primary_value
+                self.d.search(**search_kwargs, noreturn=True)
+        except:
+            self.file_list = []
+            self.table_info = [(None, None, None, None, None, None,
+                                None, None, None, None, None, None)]
+            self.count_results = 0
+            self.search_info.setText('Found ? search results')
+            self.filter_info.setText('Showing ? filter matches')
+            self.info_detail.append('\nERROR: invalid search paramaters and/or'
+                                   +' malformed database entry.')
+            self.info_detail.append('\nPlease check the inputs and try again')
+            return
 
         self.selected_file = None
         if len(self.d.eis_str) > 0:
