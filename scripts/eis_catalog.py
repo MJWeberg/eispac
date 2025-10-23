@@ -12,12 +12,14 @@ features, at least initially. Very much a work in progress.
 (2023-Jul-11) Added data mirrors for eis_cat.sqlite and HDF5 files
 (2023-Sep-23) Added viewing context images from MSSL
 (2024-May-07) Removed PyQt4 support, cleaned-up code and fixed a search bug
+(2025-Oct-07) Added viewing thumbnial images from MSSLeis
 """
 __all__ = ['eis_catalog']
 
 import sys
 import time
 import os
+import copy
 import pathlib
 import argparse
 import urllib
@@ -44,10 +46,48 @@ def get_remote_image_dir(filename):
     base_url = 'https://solarb.mssl.ucl.ac.uk/SolarB/DEV/eis_gifs/'
     return base_url + file_dir
 
+def convert_ll_title_to_line_id(ll_title):
+    title_split = ll_title.split(None)
+    ion = title_split[0]
+    wave = title_split[-1]
+
+    odd_list = ['FeVIIIXII', 'FeXIIX', 'FeXXIVetc', 'FeXXI',
+                'FeXIVMgVI', 'CaXVIIOV', 'XVIXXIII', 'MgVIFe']
+    odd_split_ind = [6, 4, 6, 3, 
+                     5, 6, 3, 4]
+    if ion in odd_list:
+        # First, check for strange and malformed line IDs
+        split_ind = odd_split_ind[odd_list.index(ion)]
+        elem = ion[:split_ind]
+        charge = ion[split_ind:]
+    elif ion[1] in ['I', 'V', 'X']:
+        # Single character element (e.g. "O" or "S")
+        elem = ion[0]
+        charge = ion[1:]
+    elif ion[2] in ['I', 'V', 'X']:
+        # Two character element (e.g. "Fe" or "Mg")
+        elem = ion[:2]
+        charge = ion[2:]
+    elif ion.startswith('CCD') or ion.startswith('ccd'):
+        # Full CCD window
+        elem = ion[:-1]
+        charge = '0'
+    elif len(title_split) > 2:
+        # title already had a space
+        elem = ion
+        charge = title_split[1]
+    else:
+        # Placeholder for anything that does not fit above
+        elem = ion
+        charge = 'M'
+
+    return f"{elem}_{charge}_{float(wave):7.3f}"
+
 class Top(QtWidgets.QWidget):
 
     def __init__(self, cat_filepath, parent=None):
         super(Top, self).__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
         self.file_list = None
         self.selected_file = None
         self.selected_info = []
@@ -58,8 +98,17 @@ class Top(QtWidgets.QWidget):
         self.default_topdir = os.path.join(os.getcwd(), 'data_eis')
         self.dbfile = str(pathlib.Path(cat_filepath).resolve())
         self.db_loaded = False
+
+        # Image settings
+        self.context_eis_file = None
         self.context_imgNX = 768 #512
         self.context_imgNY = 768 #512
+        self.thumb_eis_file = None
+        self.num_thumb_cols = 5
+        self.thumb_imgNX = 130
+        self.thumb_imgNY = 130
+        self.thumb_dialog = None
+        self.thumb_dialog_iwin = None
 
         # Font settings
         self.default_font = QtGui.QFont()
@@ -91,10 +140,9 @@ class Top(QtWidgets.QWidget):
         # Load EIS as-run catalog (will also search other common dirs)
         if os.path.isfile(self.dbfile) or os.path.isdir(self.dbfile):
             self.d = EISAsRun(self.dbfile)
-            if self.d is not None:
+            if self.d.cat_filepath is not None:
                 self.db_loaded = True
                 self.dbfile = str(pathlib.Path(self.d.cat_filepath).resolve())
-
         
         if self.db_loaded == False:
             # Ask if the user wants to download a copy of the database
@@ -103,10 +151,16 @@ class Top(QtWidgets.QWidget):
                         'Would you like to download a copy to your home directory?',
                         QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
             if ask_db == QtWidgets.QMessageBox.Yes:
-                self.dbfile = download_db() # will download to home dir
+                # Default to downloading from NRL and, if that fails, try NASA
+                # Will download to the user home dir
+                try:
+                    self.dbfile = download_db()
+                except:
+                    self.dbfile = download_db(source='NASA')
                 if not str(self.dbfile).endswith('.part'):
                     self.d = EISAsRun(self.dbfile)
                     self.db_loaded = True
+                    self.dbfile = str(pathlib.Path(self.d.cat_filepath).resolve())
                 else:
                     print('Failed to download EIS database!')
             else:
@@ -114,7 +168,10 @@ class Top(QtWidgets.QWidget):
 
         # Initialze the network manager for downloading images
         self.manager = QtNetwork.QNetworkAccessManager()
-        self.manager.finished.connect(self.on_finished)
+        self.manager.finished.connect(self.finished_context_download)
+
+        self.thumb_manager = QtNetwork.QNetworkAccessManager()
+        self.thumb_manager.finished.connect(self.finished_thumb_download)
 
         self.init_ui()
 
@@ -225,42 +282,39 @@ class Top(QtWidgets.QWidget):
     def event_help(self):
         """Put help info in details window."""
         self.info_help.clear()
-        help_text = """EIS As-Run Catalog Search Tool
+        help_text = """### Searching for Obervations
 
-### Searching for Obervations
-
-* Please use ISO format dates (YYYY-MM-DD HH:MM). If only the
-  start date is provided, the end will be set for 24 hours later.
-  WARNING: "Date Only" searches over the entire mission can take
-  a VERY long time, please be patient.
+* If only the start date is provided, the end will be set for 24 hours later.
+  WARNING: "Date Only" searches over the entire mission can take a VERY long 
+  time, please be patient.
 
 * Primary search criteria descriptions (with catalog column names):
 
   Study ID (study_id)
-      ID number for specific observation plan (line list, raster
-      steps, etc.). Studies may repeated throughout the mission.
+      ID number for specific observation plan (e.g. line list & rasters). 
+      Studies may repeated throughout the mission.
 
   Study Acronym (stud_acr)
-      Short text label for the study. You only need to input a
-      few characters (case is ignored).
+      Short text label for the study. You only need to input a few characters 
+      (case is ignored).
 
   HOP ID (jop_id)
-      Hinode Operation Plan ID. Assigned to observations that were
-      coordinated with other telescopes or spacecraft missions.
+      Hinode Operation Plan ID. Assigned to observations that were coordinated 
+      with other telescopes or spacecraft missions. 
       Also known as "JOP ID" (Joint Obs. Program ID)
 
   Obs. Title (obstitle)
-      Observation title. Just a word or two is enough, results will
-      be shown for all titles containing the input text.
+      Observation title. Just a word or two is enough, results will be shown 
+      for all titles containing the input text.
 
   Raster ID (rast_id) and Raster Acr. (rast_acr)
-      ID number and short text label for the raster program used in
-      the study. Rasters may be shared by multiple studies.
+      ID number and short text label for the raster program used in the study. 
+      Rasters may be shared by multiple studies.
       
   Triggered Obs
-      Any raster run in response to an on-board trigger. There 
-      are three triggers that can be run: XRT flare (tl_id=1),
-      EIS flare (tl_id=3), & EIS bright point (tl_id=4). 
+      Any raster run in response to an on-board trigger. There are three 
+      triggers that can be run: XRT flare (tl_id=1), EIS flare (tl_id=3), 
+      & EIS bright point (tl_id=4). 
       Selecting this the same as using Timeline ID = 1, 3, 4 
 
   Target (target)
@@ -275,18 +329,17 @@ class Top(QtWidgets.QWidget):
       sequence. Timeline IDs of 1, 3, & 4 are special (see above), 
       all other values should be unique over the life of EIS.
 
-  Please Note: If "Target" and "Science Obj." are not defined by
-  the EIS planner, default values "Quiet Sun" & "QS" are assigned,
-  regardless of the actual observation target.
+* Multiple ID numbers may be searched at the same time by separating
+  the numbers with "," (e.g. "1, 3, 4"). Ranges of numbers can be 
+  searched by separating the start & end values with "-" (e.g. "1-4")
 
-  * Multiple ID numbers may be searched at the same time by separating
-    the numbers with "," (e.g. "1, 3, 4"). Ranges of numbers can be 
-    searched by separating the start & end values with "-" (e.g. "1-4")
+* If "Target" and "Science Obj." are not defined by the EIS planner, 
+  default values are assigned based on the orginal study use case.
 
 ### Downloading files
 
-* If the "Use Date Tree" box is checked, files will be downloaded
-  into subdirectories organized by date (../YYYY/MM/DD/)
+* If the "Use Date Tree" box is checked, files will be downloaded into 
+  subdirectories organized by date (../YYYY/MM/DD/)
 """
         self.info_help.append(help_text)
         self.info_help.verticalScrollBar().setValue(
@@ -439,15 +492,15 @@ class Top(QtWidgets.QWidget):
         self.info_detail.clear()
         self.search_info.setText('Found ?? search results')
         self.filter_info.setText('Showing ?? filter matches')
+        self.table_m.clearContents()
+        self.table_m.setRowCount(1)
         if self.db_loaded == False:
-            self.info_detail.append('No EIS As-Run Catalog found!\n\n'
+            self.info_detail.setText('No EIS As-Run Catalog found!\n\n'
                                     +'Please use the "Update Database" '
                                     +'button above.')
             return
         else:
-            self.info_detail.append('Searching catalog. Please wait...')
-        self.table_m.clearContents()
-        self.table_m.setRowCount(1)
+            self.info_detail.setText('Searching catalog. Please wait...')
         QtWidgets.QApplication.processEvents() # update gui while user waits
 
         # Get dates and user input text
@@ -480,7 +533,16 @@ class Top(QtWidgets.QWidget):
             self.info_detail.append('\nPlease check the inputs and try again')
             return
 
+        # Clear / reset vars used to control the display
         self.selected_file = None
+        self.context_eis_file = None
+        self.thumb_eis_file = None
+        self.thumb_pixmap = [None]*25
+        self.thumb_line_ids = [None]*25
+        self.thumb_dialog_iwin = None
+        if self.thumb_dialog is not None:
+            self.thumb_dialog.clear_image()
+        
         if len(self.d.eis_str) > 0:
             info = []
             i = 0
@@ -493,8 +555,8 @@ class Top(QtWidgets.QWidget):
             self.count_results = len(info)
             self.search_info.setText('Found '+str(len(info))+' search results')
             self.info_detail.append('Search complete!')
-            self.info_detail.append('\nSelect any item in a row to see more'
-                                   +' information')
+            self.info_detail.append('\nSelect a search result to view observation'
+                                   +' details')
             self.table_info = info
             self.mk_table(info)
         else:
@@ -608,7 +670,7 @@ class Top(QtWidgets.QWidget):
 
         # Any cells highlighted?
         self.table_m.currentCellChanged.connect(self.get_details)
-        self.tabs.currentChanged.connect(self.event_update_context_image)
+        self.tabs.currentChanged.connect(self.event_update_image_tabs)
 
     def get_details(self, row, column):
         """Provide details on selected cell."""
@@ -620,6 +682,7 @@ class Top(QtWidgets.QWidget):
         except:
             row_filename = None
         if row_filename:
+            self.selected_file = row_filename
             info = self.fill_info(row_filename)
             for line in info:
                 self.info_detail.append(line)
@@ -627,14 +690,13 @@ class Top(QtWidgets.QWidget):
                 setValue(self.info_detail.verticalScrollBar().minimum())
 
             # Update the context image
-            self.event_update_context_image(0)
+            self.event_update_image_tabs(0)
 
     def fill_info(self, file):
         """Retrieve useful info for a selected file."""
         info = []
         if len(self.d.eis_str) != 0:
             row, = [x for x in self.d.eis_str if x.filename == str(file)]
-            self.selected_file = row.filename
             info.append(f"{'filename':<20} {row.filename}")
             info.append(f"{'date_obs':<20} {row.date_obs}")
             info.append(f"{'date_end':<20} {row.date_end}")
@@ -676,55 +738,153 @@ class Top(QtWidgets.QWidget):
         return info
 
     @QtCore.pyqtSlot(int)
-    def get_image(self):
+    def get_context_image(self):
         url = self.context_url
-        self.start_request(url)
+        self.start_context_request(url)
 
-    def start_request(self, url):
+    def start_context_request(self, url):
         request = QtNetwork.QNetworkRequest(QtCore.QUrl(url))
         self.manager.get(request)
 
     @QtCore.pyqtSlot(QtNetwork.QNetworkReply)
-    def on_finished(self, reply):
+    def finished_context_download(self, reply):
         target = reply.attribute(QtNetwork.QNetworkRequest.RedirectionTargetAttribute)
         if reply.error():
             print("error: {}".format(reply.errorString()))
+            self.event_clear_context_image(info_text="Context image is unavailable."
+                                                    +" Please try again later")
             return
         elif target:
             newUrl = reply.url().resolved(target)
-            self.start_request(newUrl)
+            self.start_context_request(newUrl)
             return
         pixmap = QtGui.QPixmap()
         pixmap.loadFromData(reply.readAll())
         pixmap = pixmap.scaled(self.context_imgNX, self.context_imgNY)
         self.context_img.setPixmap(pixmap)
 
-    def event_update_context_image(self, tab_index):
+    @QtCore.pyqtSlot(int)
+    def get_thumb_image(self):
+        url = self.thumb_url
+        self.start_thumb_request(url)
+
+    def start_thumb_request(self, url):
+        request = QtNetwork.QNetworkRequest(QtCore.QUrl(url))
+        self.thumb_manager.get(request)
+
+    @QtCore.pyqtSlot(QtNetwork.QNetworkReply)
+    def finished_thumb_download(self, reply):
+        target = reply.attribute(QtNetwork.QNetworkRequest.RedirectionTargetAttribute)
+        url_split = str(reply.url()).split('line_')
+        iwin = int(url_split[1][:2])
+        if reply.error():
+            print("error: {}".format(reply.errorString()))
+            self.event_clear_thumb_image(iwin, label_text='ERROR!')
+            return
+        elif target:
+            newUrl = reply.url().resolved(target)
+            self.start_thumb_request(newUrl)
+            return
+        self.thumb_pixmap[iwin] = QtGui.QPixmap()
+        self.thumb_pixmap[iwin].loadFromData(reply.readAll())
+        scaled_pixmap = self.thumb_pixmap[iwin].scaled(self.thumb_imgNX, self.thumb_imgNY)
+        self.thumb_img_list[iwin].setPixmap(scaled_pixmap)
+        self.thumb_label_list[iwin].setText(self.thumb_line_ids[iwin])
+
+        if self.thumb_dialog is not None and self.thumb_dialog_iwin == iwin:
+            self.thumb_dialog.update_image(parent=self, iwin=iwin)
+
+    def event_update_image_tabs(self, tab_index):
         """Download context image into memory and update the image tab"""
 
-        if self.tabs.currentIndex() == 1:
+        if (self.tabs.currentIndex() == 1 and self.selected_file is not None
+        and self.selected_file != self.context_eis_file):
+            # Display a context AIA or EIT image along with some key details
+            self.context_eis_file = self.selected_file
             try:
                 clean_filename = self.selected_file.replace('.gz', '')
                 remote_dir = get_remote_image_dir(clean_filename)
                 context_img_name = 'XRT_'+clean_filename+'.gif'
                 self.context_url = remote_dir+context_img_name
-                self.get_image()
+                self.get_context_image()
             except:
                 print('   ERROR: context images or server are unavailable.')
 
             self.info_context.clear()
             for line in self.selected_info:
                 self.info_context.append(line)
+        elif (self.tabs.currentIndex() == 2 and self.selected_file is not None
+        and self.selected_file != self.thumb_eis_file):
+            # Display a grid of thumbnail images
+            self.thumb_eis_file = self.selected_file
+            self.thumb_title.setText(f"{self.thumb_eis_file} Intensity Maps"
+                                    +f" from MSSL (click to view larger)")
+            clean_filename = self.selected_file.replace('.gz', '')
+            remote_dir = get_remote_image_dir(clean_filename)
+            # Get line IDs for the thumbnails
+            row = self.d.eis_str[np.where(self.d.eis_str['filename'] == self.selected_file)]
+            max_thumbs = row['n_windows'][0]
+            self.thumb_line_ids = ['']*25
+            for w in range(max_thumbs):
+                self.thumb_line_ids[w] = convert_ll_title_to_line_id(row.ll_title[0][w])
+            for iwin in range(25):
+                if iwin < max_thumbs:
+                    try:
+                        thumb_filename = f"{clean_filename}_line_{iwin:02}" \
+                                         +f"_{self.thumb_line_ids[iwin]}.int.gif"
+                        self.thumb_url = remote_dir+thumb_filename
+                        self.thumb_label_list[iwin].setText('UPDATING...')
+                        self.get_thumb_image()
+                    except:
+                        print('   ERROR: thumbnail images or server are unavailable.')
+                else:
+                    self.event_clear_thumb_image(iwin)
         else:
-            self.event_clear_context_image()
+            if self.context_eis_file is None:
+                self.event_clear_context_image()
+                self.info_context.setText('Select a search result to view the context image')
+            
+            if self.thumb_eis_file is None:
+                self.thumb_title.setText(f"Select a search result to view thumbnails")
+                for iwin in range(25):
+                    self.event_clear_thumb_image(iwin)
+                if self.thumb_dialog is not None:
+                    self.thumb_dialog.clear_image()
 
-    def event_clear_context_image(self):
+    def event_clear_context_image(self, info_text=''):
         self.info_context.clear()
-        self.info_context.append('Select any item in a row to see a context'
-                                +' image')
+        self.info_context.append(info_text)
         buff = np.zeros((self.context_imgNX, self.context_imgNX, 3), dtype=np.int16)
-        image = QtGui.QImage(buff, self.context_imgNX, self.context_imgNY, QtGui.QImage.Format_ARGB32)
+        image = QtGui.QImage(buff, self.context_imgNX, self.context_imgNY,
+                             QtGui.QImage.Format_ARGB32)
         self.context_img.setPixmap(QtGui.QPixmap(image))
+
+    def event_clear_thumb_image(self, iwin, label_text=''):
+        image = QtGui.QImage(self.blank_thumb, self.thumb_imgNX, self.thumb_imgNY, 
+                             QtGui.QImage.Format_ARGB32)
+        self.thumb_img_list[iwin].setPixmap(QtGui.QPixmap(image))
+        self.thumb_label_list[iwin].setText(label_text)
+
+        if self.thumb_dialog is not None and self.thumb_dialog_iwin == iwin:
+            self.thumb_dialog.clear_image()
+
+    def eventFilter(self, source, event):
+        if event.type() == QtCore.QEvent.MouseButtonPress:
+            self.event_thumb_dialog(int(source.objectName().split('_')[-1]))
+        return super(Top, self).eventFilter(source, event)
+
+    def event_thumb_dialog(self, iwin=0):
+        """Event for opening the dialog box for viewing a larger thumbnail"""
+        self.thumb_dialog_iwin = iwin
+        old_geometry = None
+        if self.thumb_dialog is not None:
+            dialog_is_vis = self.thumb_dialog.isVisible()
+            if dialog_is_vis:
+                old_geometry = self.thumb_dialog.geometry()
+            self.thumb_dialog.close()
+        self.thumb_dialog = ThumbDialog(self, iwin=iwin, 
+                                        old_geometry=old_geometry)
+        self.thumb_dialog.show()
 
     def details(self):
         """Display detailed cat info."""
@@ -733,8 +893,12 @@ class Top(QtWidgets.QWidget):
         self.detail_tab = QtWidgets.QWidget()
         self.image_tab = QtWidgets.QWidget()
         self.help_tab = QtWidgets.QWidget()
+        self.thumb_tab = QtWidgets.QScrollArea()
+        self.thumb_tab.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.thumb_tab.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.tabs.addTab(self.detail_tab,"Details")
-        self.tabs.addTab(self.image_tab,"Images")
+        self.tabs.addTab(self.image_tab,"Context Image")
+        self.tabs.addTab(self.thumb_tab,"Intensity Maps")
         self.tabs.addTab(self.help_tab,"Help")
 
         # Create details tab
@@ -745,21 +909,58 @@ class Top(QtWidgets.QWidget):
         self.detail_tab.grid.addWidget(self.info_detail)
         self.detail_tab.setLayout(self.detail_tab.grid)
 
-        # Create the image tab and initialize SSL context for downloading
+        # Create context image tab and initialize SSL context for downloading
         self.image_tab.grid = QtWidgets.QGridLayout()
         self.info_context = QtWidgets.QTextEdit()
         self.info_context.setFont(self.info_detail_font)
         self.info_context.setReadOnly(True)
         self.image_tab.grid.addWidget(self.info_context, 0, 0)
         self.context_img = QtWidgets.QLabel()
-        buff = np.zeros((self.context_imgNX, self.context_imgNX, 3), dtype=np.int16)
-        image = QtGui.QImage(buff, self.context_imgNX, self.context_imgNY,
-                             QtGui.QImage.Format_ARGB32)
-        self.context_img.setPixmap(QtGui.QPixmap(image))
         self.image_tab.grid.addWidget(self.context_img, 1, 0, 4, 1)
         self.image_tab.setLayout(self.image_tab.grid)
+        self.event_clear_context_image()
+        self.info_context.setText('Select a search result to view the context image')
+
         # self.ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS)
         # self.ssl_context.load_verify_locations(certifi.where())
+
+        # Create thumbnail images tab
+        self.thumb_gallery = QtWidgets.QWidget()
+        self.thumb_gallery.grid = QtWidgets.QGridLayout()
+        self.thumb_title = QtWidgets.QLabel(self)
+        self.thumb_title.setFont(self.default_font)
+        self.thumb_title.setAlignment(QtCore.Qt.AlignCenter)
+        self.thumb_title.setText('Select a search result to view thumbnails')
+        self.thumb_gallery.grid.addWidget(self.thumb_title, 0, 0, 1, self.num_thumb_cols)
+        self.blank_thumb = np.zeros((self.thumb_imgNX, self.thumb_imgNX, 3), dtype=np.int16)
+        self.thumb_pixmap = [None]*25
+        self.thumb_img_list = [None]*25
+        self.thumb_line_ids = [None]*25
+        self.thumb_label_list = [None]*25
+        for iwin in range(25):
+            t_row = int(iwin / self.num_thumb_cols)
+            t_col = int(iwin % self.num_thumb_cols)
+            self.thumb_img_list[iwin] = QtWidgets.QLabel()
+            self.thumb_img_list[iwin].setObjectName(f'thumb_{iwin}')
+            image = QtGui.QImage(self.blank_thumb, self.thumb_imgNX, self.thumb_imgNY,
+                                 QtGui.QImage.Format_ARGB32)
+            self.thumb_img_list[iwin].setPixmap(QtGui.QPixmap(image))
+            self.thumb_img_list[iwin].installEventFilter(self)
+            self.thumb_gallery.grid.addWidget(self.thumb_img_list[iwin], 2*t_row+1, t_col)
+
+            self.thumb_label_list[iwin] = QtWidgets.QLabel(self)
+            self.thumb_label_list[iwin].setFixedWidth(self.thumb_imgNX)
+            self.thumb_label_list[iwin].setFont(self.small_font)
+            self.thumb_label_list[iwin].setAlignment(QtCore.Qt.AlignCenter)
+            self.thumb_label_list[iwin].setStyleSheet('''
+                padding-top: 0px;
+                padding-bottom: 8px;
+                QLabel { qproperty-indent: 0; }''')
+            self.thumb_label_list[iwin].setText('')
+            self.thumb_gallery.grid.addWidget(self.thumb_label_list[iwin], 2*t_row+2, t_col)
+
+        self.thumb_gallery.setLayout(self.thumb_gallery.grid)
+        self.thumb_tab.setWidget(self.thumb_gallery)
 
         # Create help tab
         self.help_tab.grid = QtWidgets.QGridLayout()
@@ -771,8 +972,9 @@ class Top(QtWidgets.QWidget):
 
         # Add tabs to main window
         self.tabs.setStyleSheet('QTabBar{font-size: 11pt; font-family: Courier New;}')
-        self.grid.addWidget(self.tabs, 1, 6, self.gui_row + 1, 3)
-        self.tabs.setCurrentIndex(2) # switch to help tab
+        # self.grid.addWidget(self.tabs, 1, 6, self.gui_row + 1, 3)
+        self.grid.addWidget(self.tabs, 0, 6, self.gui_row + 2, 3)
+        self.tabs.setCurrentIndex(3) # switch to help tab
 
     def event_apply_filter(self):
         if self.count_results > 0:
@@ -900,7 +1102,81 @@ class Top(QtWidgets.QWidget):
                         print(item)
                 print(f' + wrote {filename}')
 
-# this class handles the redirection of stdout, not implemented yet.
+    def event_quit(self):
+        """Close all figures, clean-up GUI objects, and quit the app"""
+        if self.thumb_dialog is not None:
+            self.thumb_dialog.close()
+        QtWidgets.QApplication.instance().quit()
+        self.close()
+
+    def closeEvent(self, event):
+        """Override the close event when the "X" button on the window is clicked"""
+        self.event_quit()
+
+class ThumbDialog(QtWidgets.QDialog):
+    """Make a cutom dialog box for viewing a larger thumbnail"""
+    def __init__(self, parent=None, iwin=0, old_geometry=None):
+        super().__init__(parent)
+
+        self.thumb_gallery = QtWidgets.QWidget()
+        self.grid = QtWidgets.QGridLayout()
+    
+        # Placeholder image
+        self.thumb_imgNX = 768
+        self.thumb_imgNY = 768
+        self.blank_thumb = np.zeros((self.thumb_imgNX, self.thumb_imgNX, 3), 
+                                    dtype=np.int16)
+        image = QtGui.QImage(self.blank_thumb, self.thumb_imgNX, self.thumb_imgNY, 
+                             QtGui.QImage.Format_ARGB32)
+        pixmap = QtGui.QPixmap(image)
+
+        self.thumb_img = QtWidgets.QLabel(self)
+        self.thumb_img.setPixmap(pixmap)
+        self.grid.addWidget(self.thumb_img, 0, 0)
+
+        self.thumb_label = QtWidgets.QLabel(self)
+        self.thumb_label.setFont(parent.default_font)
+        self.thumb_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.thumb_label.setText("")
+        self.grid.addWidget(self.thumb_label, 1, 0)
+        self.setLayout(self.grid)
+
+        self.update_image(parent=parent, iwin=iwin)
+        if old_geometry is not None:
+            self.setGeometry(old_geometry) # Keep previous on-screen location
+
+    def update_image(self, parent=None, iwin=0):
+        """Update the thumbnail image"""
+        self.setWindowTitle(f"EIS Intensity Thumbnail from MSSL")
+        label_str = f"{parent.thumb_eis_file}   |   Window {iwin}" \
+                   +f"   |   {parent.thumb_line_ids[iwin]}"
+    
+        pixmap = parent.thumb_pixmap[iwin]
+        if pixmap is not None:
+            self.thumb_imgNX = pixmap.width()
+            self.thumb_imgNY = pixmap.height()
+        else:
+            self.thumb_imgNX = 768
+            self.thumb_imgNY = 768
+            self.blank_thumb = np.zeros((self.thumb_imgNX, self.thumb_imgNX, 3), 
+                                        dtype=np.int16)
+            image = QtGui.QImage(self.blank_thumb, self.thumb_imgNX, self.thumb_imgNY, 
+                                 QtGui.QImage.Format_ARGB32)
+            pixmap = QtGui.QPixmap(image)
+
+        self.thumb_img.setPixmap(pixmap)
+        self.thumb_label.setText(label_str)
+        
+
+    def clear_image(self, label_text=''):
+        """Clear the thumnail image"""
+        self.blank_thumb = np.zeros((self.thumb_imgNX, self.thumb_imgNX, 3), dtype=np.int16)
+        image = QtGui.QImage(self.blank_thumb, self.thumb_imgNX, self.thumb_imgNY, 
+                             QtGui.QImage.Format_ARGB32)
+        self.thumb_img.setPixmap(QtGui.QPixmap(image))
+        self.thumb_label.setText(label_text)
+
+# [NOT IMPLEMENTED YET] This class will handles the redirection of stdout
 class OutLog:
     def __init__(self, edit, out=None):
         self.edit = edit
@@ -912,7 +1188,6 @@ class OutLog:
 
         if self.out:
             self.out.write(m)
-
 
 #-#-#-#-# MAIN #-#-#-#-#
 def eis_catalog():
