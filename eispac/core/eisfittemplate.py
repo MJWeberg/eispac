@@ -13,6 +13,8 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
+from eispac.data import get_fit_template_filepath
+
 class EISFitTemplate:
     """Multigaussian fitting template for use with MPFIT and `~eispac.core.fit_spectra`
 
@@ -407,6 +409,7 @@ class EISFitTemplate:
         rows.append(f"wmin, wmax: {self.template['wmin']}, {self.template['wmax']}")
         rows.append('')
         rows.append('--- PARAMETER CONSTRAINTS ---')
+        rows.append('Note: Gaussian parameters are in the order of [PEAK, CENTROID, WIDTH]')
         rows.append(f"{'*':>4} {'Value':>16} {'Fixed':>7} "
                    +f"{'Limited':>11} {'Limits':>19} {'Tied':>19}")
         for i, p in enumerate(self.parinfo):
@@ -534,3 +537,34 @@ class EISFitTemplate:
                 # note: this parinfo will be an alternative dict of lists
 
         return cls(filename, template, parinfo)
+    
+    def view(self):
+        """Display an example image for templates packaged with EISPAC
+        """
+        # Check for a valid template image
+        if self.filename_temp is None or self.filename_temp.startswith('unknown'):
+            print(f'ERROR: template filename is unknown!', file=sys.stderr)
+            return None
+        
+        img_filename = pathlib.Path(self.filename_temp).name.replace('.h5', '.jpg')
+
+        try:
+            img_filepath = get_fit_template_filepath(img_filename)
+        except:
+            print(f"ERROR: example image not found! If this template was "
+                 +f"included with EISPAC, please ensure the filename has not "
+                 +f"been changed.", file=sys.stderr)
+            return None
+        
+        # Imports
+        from PIL import Image
+        import matplotlib.pyplot as plt
+
+        # Display the image as a matplotlig plot
+        img_data = Image.open(img_filepath)
+        tmplt_fig = plt.figure(figsize=[14,6])
+        tmplt_ax = tmplt_fig.add_subplot(111)
+        tmplt_img = tmplt_ax.imshow(img_data, cmap='grey', interpolation='blackman')
+        tmplt_ax.axis('off')
+        tmplt_fig.tight_layout()
+        plt.show()
