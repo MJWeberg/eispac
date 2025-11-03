@@ -863,7 +863,7 @@ class MainWindow(QtWidgets.QWidget):
                 self.wave_sum_range[r_ind] = [wave_min_val, wave_max_val]
 
                 # Sum the data along the wavelength axis
-                rast_data = np.sum(self.eis_cube[r_ind].data[:,:,iwave_min:iwave_max], axis=2)
+                rast_data = np.nansum(self.eis_cube[r_ind].data[:,:,iwave_min:iwave_max], axis=2)
                 
                 # Set plot options
                 this_var = 'intensity_obs'
@@ -1105,6 +1105,8 @@ class MainWindow(QtWidgets.QWidget):
             c_ix = np.argmin(np.abs(self.rast_xcoords[r_ind] - x_val))
             c_iy = self.crosshair_ind[r_ind][1]
             self.crosshair_val[r_ind] = self.rast_img[r_ind].get_array()[c_iy, c_ix]
+            if self.crosshair_val[r_ind] is np.ma.masked:
+                self.crosshair_val[r_ind] = -999.99
             cross_label = str(round(self.crosshair_val[r_ind], 2))
 
             # Plot crosshair and display legend

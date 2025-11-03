@@ -12,7 +12,8 @@ features, at least initially. Very much a work in progress.
 (2023-Jul-11) Added data mirrors for eis_cat.sqlite and HDF5 files
 (2023-Sep-23) Added viewing context images from MSSL
 (2024-May-07) Removed PyQt4 support, cleaned-up code and fixed a search bug
-(2025-Oct-07) Added viewing thumbnial images from MSSLeis
+(2025-Oct-23) Added viewing thumbnail images from MSSL
+(2025-Oct-24) Added viewing thumbnail images from OSLO
 """
 __all__ = ['eis_catalog']
 
@@ -33,20 +34,83 @@ from eispac.db.eisasrun import EISAsRun
 from eispac.db.download_hdf5_data import download_hdf5_data
 from eispac.db.download_db import download_db
 
-def get_remote_image_dir(filename):
+import sunpy.map
+from sunpy.coordinates import frames, get_earth
+from sunpy.coordinates.utils import get_limb_coordinates
+
+
+try:
+    # Newer version of matplotlib (has support for Qt6)
+    from matplotlib.backends.backend_qtagg import FigureCanvas
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+except:
+    # Fallback imports (should still work in newer version of matplotlib)
+    from matplotlib.backends.backend_qt5agg import FigureCanvas
+    from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+
+from matplotlib.backend_bases import MouseButton
+from matplotlib.backends.qt_compat import QtWidgets
+from matplotlib.figure import Figure
+# from matplotlib.ticker import FormatStrFormatter
+
+import astropy.units as u
+from astropy.coordinates import SkyCoord
+from astropy.visualization import ImageNormalize, AsinhStretch, LinearStretch
+# from astropy.wcs.utils import wcs_to_celestial_frame
+
+def get_remote_image_dir(filename, source='MSSL'):
     """Parse a Level-0 filename and get the remote image dir"""
     # Note: level-0 files have the form, eis_l0_YYYYMMDD_hhmmss.fits
     date_str = filename.split('_')[2]
     year_str = date_str[0:4]
     month_str = date_str[4:6]
     day_str = date_str[6:8]
-    file_dir = year_str+'/'+month_str+'/'+day_str+'/'+filename+'/'
 
     # Assemble and return the URL
-    base_url = 'https://solarb.mssl.ucl.ac.uk/SolarB/DEV/eis_gifs/'
+    if source.upper() == 'MSSL':
+        file_dir = year_str+'/'+month_str+'/'+day_str+'/'+filename+'/'
+        base_url = 'https://solarb.mssl.ucl.ac.uk/SolarB/DEV/eis_gifs/'
+    elif source.upper() == 'OSLO':
+        # Note: OSLO assumes that the filename does NOT end in ".fits"
+        shorter_name = filename.replace('.fits', '')
+        file_dir = year_str+'/'+month_str+'/'+day_str+'/'+shorter_name+'/'
+        base_url = 'https://sdc.uio.no/vol/icons/eis/level0/'
+    
+    return base_url + file_dir
+
+def get_aia_synoptic_url(filename, wavelength=171):
+    """Parse a Level-0 filename and get nearest matching AIA synoptic image"""
+    # Note: level-0 files have the form, eis_l0_YYYYMMDD_hhmmss.fits
+    # Note: the jsoc AIA files have the form AIA20250222_2222_0171.fits
+    date_str = filename.split('_')[2]
+    year_str = date_str[0:4]
+    month_str = date_str[4:6]
+    day_str = date_str[6:8]
+
+    time_str = filename.split('_')[3]
+    hour_str = time_str[0:2]
+    min_str = time_str[2:4]
+
+    # The AIA data has a 2 min cad, therefore we round DOWN to nearest even min
+    lower_min = f"{2*int(int(min_str)/2):02}"
+
+    # wavelength must be 94, 131, 171, 193, 211, 304, 335, 1600, or 4500
+    wave_str = f"{wavelength:04}"
+
+    filename = f"AIA{year_str}{month_str}{day_str}_{hour_str}{lower_min}_{wave_str}.fits"
+    file_dir = f"{year_str}/{month_str}/{day_str}/H{hour_str}00/{filename}"
+    base_url = 'https://jsoc1.stanford.edu/data/aia/synoptic/'
+    
     return base_url + file_dir
 
 def convert_ll_title_to_line_id(ll_title):
+    """Convert an as-run window ID to a standardized line ID"""
+    # e.g. FeXII 195.12 converts to  Fe_XII_195.120
+
+    if ll_title is None or len(ll_title) < 2:
+        # Return an empty string for empty or invalid IDs
+        return "" 
+    
     title_split = ll_title.split(None)
     ion = title_split[0]
     wave = title_split[-1]
@@ -89,7 +153,11 @@ class Top(QtWidgets.QWidget):
         super(Top, self).__init__(parent)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
         self.file_list = None
+        self.date_obs_list = None
+        self.result_ind_list = None
         self.selected_file = None
+        self.selected_date_obs = None
+        self.selected_result = None
         self.selected_info = []
         self.default_filename = 'eis_filelist.txt'
         self.default_start_time = '2018-05-29 00:00' # '29-May-2018 00:00'
@@ -109,6 +177,9 @@ class Top(QtWidgets.QWidget):
         self.thumb_imgNY = 130
         self.thumb_dialog = None
         self.thumb_dialog_iwin = None
+        self.aia_eis_file = None
+        self.aia_fits = str(pathlib.Path.home() / 'eis_catalog_temp_aia.fits')
+        self.aia_click = None
 
         # Font settings
         self.default_font = QtGui.QFont()
@@ -523,6 +594,8 @@ class Top(QtWidgets.QWidget):
                 self.d.search(**search_kwargs, noreturn=True)
         except:
             self.file_list = []
+            self.date_obs_list = []
+            self.result_ind_list = []
             self.table_info = [(None, None, None, None, None, None,
                                 None, None, None, None, None, None)]
             self.count_results = 0
@@ -535,11 +608,15 @@ class Top(QtWidgets.QWidget):
 
         # Clear / reset vars used to control the display
         self.selected_file = None
+        self.selected_date_obs = None
+        self.selected_result = None
+        self.selected_result_ind = None
         self.context_eis_file = None
         self.thumb_eis_file = None
         self.thumb_pixmap = [None]*25
         self.thumb_line_ids = [None]*25
         self.thumb_dialog_iwin = None
+        self.aia_eis_file = None
         if self.thumb_dialog is not None:
             self.thumb_dialog.clear_image()
         
@@ -561,6 +638,8 @@ class Top(QtWidgets.QWidget):
             self.mk_table(info)
         else:
             self.file_list = []
+            self.date_obs_list = []
+            self.result_ind_list = []
             self.table_info = [(None, None, None, None, None, None,
                                 None, None, None, None, None, None)]
             self.count_results = 0
@@ -603,6 +682,8 @@ class Top(QtWidgets.QWidget):
         """Add entries to the results table."""
         len_info = len(info)
         self.file_list = []
+        self.date_obs_list = []
+        self.result_ind_list = []
         self.table_m.clearContents()
         self.table_m.setRowCount(1)
         r_type = self.rast_types[self.rast_type_box.currentText()]
@@ -660,6 +741,8 @@ class Top(QtWidgets.QWidget):
                 for col_j in range(6):
                     self.table_m.item(new_row_ind, col_j).setBackground(QtGui.QColor(222,222,222))
             self.file_list.append(info[row][6])
+            self.date_obs_list.append(info[row][0])
+            self.result_ind_list.append(row)
 
         # Update filter count label
         if r_type is None and s_index is None and not any(wave_list):
@@ -683,6 +766,9 @@ class Top(QtWidgets.QWidget):
             row_filename = None
         if row_filename:
             self.selected_file = row_filename
+            self.selected_date_obs = str(self.date_obs_list[row])
+            self.selected_result_ind = int(self.result_ind_list[row])
+            self.selected_result = self.d.eis_str[self.selected_result_ind]
             info = self.fill_info(row_filename)
             for line in info:
                 self.info_detail.append(line)
@@ -710,12 +796,16 @@ class Top(QtWidgets.QWidget):
             info.append(f"{'obs_dec':<20} {row.obs_dec}")
             info.append(f"{'sci_obj':<20} {row.sci_obj}")
             info.append(f"{'target':<20} {row.target}")
+            # Note: SAA and HLZ do not match the actual time periods
+            # info.append(f"{'saa, hlz':<20} {row.saa}, {row.hlz}")
+            # Note: tr_mode seems to be filled with "0" in the as-run DB (Fits files are fine?)
+            # info.append(f"{'tr_mode':<20} {row.tr_mode}")
             info.append(f"{'rastertype':<20} {self.rtype_dict[int(row.rastertype)]}")
             info.append(f"{'slit_index':<20} {self.sindex_dict[int(row.slit_index)]}")
             info.append(f"{'scan_fm_nsteps':<20} {row.scan_fm_nsteps}")
             info.append(f"{'scan_fm_stepsize':<20} {row.scan_fm_stepsize}")
             info.append(f"{'nexp':<20} {row.nexp}")
-            info.append(f"{'exptime':<20} {row.exptime}")
+            info.append(f"{'exptime':<20} {row.exptime[0:row.nexp]}")
 
             line_list_title = f"----- Line List (ll_id: {row.ll_id},  ll_acr: {row.ll_acr}) -----"
             info.append(f"\n\n{line_list_title:<55}")
@@ -751,17 +841,32 @@ class Top(QtWidgets.QWidget):
         target = reply.attribute(QtNetwork.QNetworkRequest.RedirectionTargetAttribute)
         if reply.error():
             print("error: {}".format(reply.errorString()))
-            self.event_clear_context_image(info_text="Context image is unavailable."
-                                                    +" Please try again later")
+            if 'jsoc' in str(reply.url()):
+                self.event_plot_aia_context(plot_wireframe=True)
+            else:
+                self.event_clear_context_image(info_text="Context image is unavailable."
+                                                        +" Please try again later")
             return
         elif target:
             newUrl = reply.url().resolved(target)
             self.start_context_request(newUrl)
             return
-        pixmap = QtGui.QPixmap()
-        pixmap.loadFromData(reply.readAll())
-        pixmap = pixmap.scaled(self.context_imgNX, self.context_imgNY)
-        self.context_img.setPixmap(pixmap)
+        
+        if 'jsoc' in str(reply.url()):
+            # Save to disk, then plot the low-res AIA "synoptic" image (~1.5 MB)
+            if os.path.isfile(self.aia_fits):
+                os.remove(self.aia_fits)
+            f = QtCore.QFile(self.aia_fits)
+            f.open(QtCore.QIODevice.ReadWrite)
+            f.write(reply.readAll())
+            f.close()
+            self.event_plot_aia_context(load_aia=True)
+        else:
+            # Display the MSSL context image (~50 kB file)
+            pixmap = QtGui.QPixmap()
+            pixmap.loadFromData(reply.readAll())
+            pixmap = pixmap.scaled(self.context_imgNX, self.context_imgNY)
+            self.context_img.setPixmap(pixmap)
 
     @QtCore.pyqtSlot(int)
     def get_thumb_image(self):
@@ -775,8 +880,13 @@ class Top(QtWidgets.QWidget):
     @QtCore.pyqtSlot(QtNetwork.QNetworkReply)
     def finished_thumb_download(self, reply):
         target = reply.attribute(QtNetwork.QNetworkRequest.RedirectionTargetAttribute)
-        url_split = str(reply.url()).split('line_')
-        iwin = int(url_split[1][:2])
+        if self.thumb_last_source.upper() == 'MSSL':
+            url_split = str(reply.url()).split('line_')
+            iwin = int(url_split[1][:2])
+        elif self.thumb_last_source.upper() == 'OSLO':
+            url_split = str(reply.url()).split('_')
+            iwin = int(url_split[-1].split('.')[0])
+       
         if reply.error():
             print("error: {}".format(reply.errorString()))
             self.event_clear_thumb_image(iwin, label_text='ERROR!')
@@ -785,9 +895,19 @@ class Top(QtWidgets.QWidget):
             newUrl = reply.url().resolved(target)
             self.start_thumb_request(newUrl)
             return
+       
         self.thumb_pixmap[iwin] = QtGui.QPixmap()
         self.thumb_pixmap[iwin].loadFromData(reply.readAll())
-        scaled_pixmap = self.thumb_pixmap[iwin].scaled(self.thumb_imgNX, self.thumb_imgNY)
+        if self.thumb_last_source.upper() == 'MSSL':
+            # All MSSL thumbnails are square
+            this_imgNX = self.thumb_imgNX
+        elif self.thumb_last_source.upper() == 'OSLO':
+            # OSLO thumbnails have fixed heights, but variable widths
+            x_scale = self.thumb_imgNY / self.thumb_pixmap[iwin].height()
+            this_imgNX = int(x_scale*self.thumb_pixmap[iwin].width())
+
+        scaled_pixmap = self.thumb_pixmap[iwin].scaled(this_imgNX, self.thumb_imgNY)
+        
         self.thumb_img_list[iwin].setPixmap(scaled_pixmap)
         self.thumb_label_list[iwin].setText(self.thumb_line_ids[iwin])
 
@@ -797,12 +917,28 @@ class Top(QtWidgets.QWidget):
     def event_update_image_tabs(self, tab_index):
         """Download context image into memory and update the image tab"""
 
+        if self.selected_file is not None:
+            clean_filename = self.selected_file.replace('.gz','')
+
+        if (self.selected_file is not None and self.tabs.currentIndex() != 2
+        and self.thumb_dialog is not None and self.thumb_dialog.isVisible()):
+            # If not on the Thumb tab, update the thumbnail dialog box
+            t_iwin = self.thumb_dialog_iwin
+            remote_dir = get_remote_image_dir(clean_filename, source=self.thumb_last_source)
+            max_thumbs = self.selected_result['n_windows']
+            if t_iwin < max_thumbs:
+                thumb_filename = self.get_remote_thumb_filename(clean_filename, iwin=t_iwin)
+                self.thumb_url = remote_dir+thumb_filename
+                self.thumb_label_list[t_iwin].setText('UPDATING...')
+                self.get_thumb_image()
+            else:
+                self.event_clear_thumb_image(iwin=t_iwin)
+
         if (self.tabs.currentIndex() == 1 and self.selected_file is not None
         and self.selected_file != self.context_eis_file):
             # Display a context AIA or EIT image along with some key details
             self.context_eis_file = self.selected_file
             try:
-                clean_filename = self.selected_file.replace('.gz', '')
                 remote_dir = get_remote_image_dir(clean_filename)
                 context_img_name = 'XRT_'+clean_filename+'.gif'
                 self.context_url = remote_dir+context_img_name
@@ -817,21 +953,16 @@ class Top(QtWidgets.QWidget):
         and self.selected_file != self.thumb_eis_file):
             # Display a grid of thumbnail images
             self.thumb_eis_file = self.selected_file
-            self.thumb_title.setText(f"{self.thumb_eis_file} Intensity Maps"
-                                    +f" from MSSL (click to view larger)")
-            clean_filename = self.selected_file.replace('.gz', '')
-            remote_dir = get_remote_image_dir(clean_filename)
-            # Get line IDs for the thumbnails
-            row = self.d.eis_str[np.where(self.d.eis_str['filename'] == self.selected_file)]
-            max_thumbs = row['n_windows'][0]
-            self.thumb_line_ids = ['']*25
-            for w in range(max_thumbs):
-                self.thumb_line_ids[w] = convert_ll_title_to_line_id(row.ll_title[0][w])
+            self.thumb_last_source = self.thumb_source_box.currentText()
+            self.thumb_title.setText(f"{self.thumb_eis_file} Intensities"
+                                    +f" (click to view larger)")
+            remote_dir = get_remote_image_dir(clean_filename, source=self.thumb_last_source)
+            self.thumb_line_ids = ['']*25 # Clear & reset the list
+            max_thumbs = self.selected_result['n_windows'] # row['n_windows'][0]
             for iwin in range(25):
                 if iwin < max_thumbs:
                     try:
-                        thumb_filename = f"{clean_filename}_line_{iwin:02}" \
-                                         +f"_{self.thumb_line_ids[iwin]}.int.gif"
+                        thumb_filename = self.get_remote_thumb_filename(clean_filename, iwin=iwin)
                         self.thumb_url = remote_dir+thumb_filename
                         self.thumb_label_list[iwin].setText('UPDATING...')
                         self.get_thumb_image()
@@ -839,7 +970,22 @@ class Top(QtWidgets.QWidget):
                         print('   ERROR: thumbnail images or server are unavailable.')
                 else:
                     self.event_clear_thumb_image(iwin)
+        elif (self.tabs.currentIndex() == 3 and self.selected_file is not None
+        and self.selected_file != self.aia_eis_file):
+            # Download & plot a "live" aia context image with the selected EIS FoV
+            self.aia_eis_file = self.selected_file
+            aia_wave = int(self.aia_wave_box.currentText())
+            self.aia_title.setText(f"{self.aia_eis_file} FoV"
+                                    +f" (middle click to toggle pan/zoom)")
+            try:
+                jsoc_url = get_aia_synoptic_url(self.selected_file, wavelength=aia_wave)
+                self.context_url = jsoc_url
+                self.get_context_image()
+            except:
+                print('   ERROR: AIA context image or server are unavailable.')
+                self.event_plot_aia_context(plot_wireframe=True)
         else:
+            # When no result is selected, clear the various image tabs
             if self.context_eis_file is None:
                 self.event_clear_context_image()
                 self.info_context.setText('Select a search result to view the context image')
@@ -850,6 +996,24 @@ class Top(QtWidgets.QWidget):
                     self.event_clear_thumb_image(iwin)
                 if self.thumb_dialog is not None:
                     self.thumb_dialog.clear_image()
+
+            if self.aia_eis_file is None:
+                self.aia_title.setText(f"Select a search result to view AIA context")
+                self.event_plot_aia_context(clear=True)
+
+    def get_remote_thumb_filename(self, eis_filename, iwin=0):
+        clean_filename = eis_filename
+
+        self.thumb_line_ids[iwin] = convert_ll_title_to_line_id(self.selected_result['ll_title'][iwin])
+
+        if self.thumb_last_source.upper() == 'MSSL':
+            thumb_filename = f"{clean_filename}_line_{iwin:02}" \
+                            +f"_{self.thumb_line_ids[iwin]}.int.gif"
+        elif self.thumb_last_source.upper() == 'OSLO':
+            clean_filename = clean_filename.replace('.fits','')
+            thumb_filename = f"{clean_filename}_{iwin}.jpg"
+
+        return thumb_filename
 
     def event_clear_context_image(self, info_text=''):
         self.info_context.clear()
@@ -864,9 +1028,80 @@ class Top(QtWidgets.QWidget):
                              QtGui.QImage.Format_ARGB32)
         self.thumb_img_list[iwin].setPixmap(QtGui.QPixmap(image))
         self.thumb_label_list[iwin].setText(label_text)
+        self.thumb_pixmap[iwin] = None
 
         if self.thumb_dialog is not None and self.thumb_dialog_iwin == iwin:
             self.thumb_dialog.clear_image()
+
+    def event_redraw_thumbs(self):
+        self.thumb_eis_file = None
+        self.event_update_image_tabs(2)
+
+    def event_plot_aia_context(self, load_aia=True, plot_wireframe=False, clear=False):
+        if self.aia_ax is not None:
+            self.aia_ax.cla()
+        self.aia_fig.clf() # Clear the entire figure
+
+        if clear:
+            load_aia = False
+            plot_wireframe = False 
+
+        if plot_wireframe and self.selected_date_obs is not None:
+            # Generate a wireframe placeholder map
+            limb_coords = get_limb_coordinates(get_earth(self.selected_date_obs))
+            limb_coords = limb_coords.transform_to(frames.Helioprojective)
+            max_arcsec = float(limb_coords.Tx.arcsec.max()*1.3) #scale to 2.6 Rs FoV
+            empty_scale = [max_arcsec/500, max_arcsec/500]*u.arcsec/u.pix
+            empty_data = np.zeros([1000,1000])
+            cen_coords = SkyCoord(0.0*u.arcsec, 0.0*u.arcsec, 
+                                  frame=frames.Helioprojective, observer='Earth', 
+                                  obstime=self.selected_date_obs)
+            empty_header = sunpy.map.make_fitswcs_header(empty_data, cen_coords, 
+                                                        scale=empty_scale)
+
+            aia_map = sunpy.map.Map(empty_data, empty_header)
+        elif load_aia:
+            # Load the AIA data and ensure the colormap is scaled correctly
+            aia_map = sunpy.map.Map(self.aia_fits)
+            aia_map.plot_settings['norm'] = ImageNormalize(vmin=0.0, 
+                                                stretch=AsinhStretch(0.01))
+        else:
+            # Skip plotting
+            if self.aia_ax is not None:
+                self.aia_ax.figure.canvas.draw_idle() # Update the plot!
+            return None
+
+        # Make the plot
+        self.aia_ax = self.aia_fig.add_subplot(projection=aia_map)
+        aia_map.plot(axes=self.aia_ax)
+        if plot_wireframe:
+            aia_map.draw_limb(axes=self.aia_ax, color='white')
+            aia_map.draw_grid(axes=self.aia_ax, color='white')
+
+        # Calculate the EIS FoV box corners
+        row = self.d.eis_str[np.where(self.d.eis_str['filename'] == self.selected_file)]
+        bl_coords = [row['xcen'][0] - 0.5*row['fovx'][0], row['ycen'][0] - 0.5*row['fovy'][0]]
+        tr_coords = [row['xcen'][0] + 0.5*row['fovx'][0], row['ycen'][0] + 0.5*row['fovy'][0]]
+
+        bottom_left = SkyCoord(bl_coords[0]*u.arcsec, bl_coords[1]*u.arcsec,
+                                frame=aia_map.coordinate_frame)
+        top_right = SkyCoord(tr_coords[0]*u.arcsec, tr_coords[1]*u.arcsec, 
+                                frame=aia_map.coordinate_frame)
+
+        aia_map.draw_quadrangle(bottom_left=bottom_left, top_right=top_right, axes=self.aia_ax, linewidth=2, edgecolor='white')
+        self.aia_fig.subplots_adjust(left=0.10, right=1.0, bottom=0.06, top=0.95)
+        self.aia_ax.figure.canvas.draw_idle() # Update the plot!
+        self.aia_click = self.aia_fig.canvas.mpl_connect('button_press_event', self.event_aia_click)
+
+    def event_redraw_aia_context(self):
+        self.aia_eis_file = None
+        self.event_update_image_tabs(3)
+
+    def event_aia_click(self, event):
+        """Event for clicks on the AIA context image"""
+        if event.button is MouseButton.MIDDLE:
+            # Toggle pan/zoom on middle click
+            self.aia_nav.pan()
 
     def eventFilter(self, source, event):
         if event.type() == QtCore.QEvent.MouseButtonPress:
@@ -892,13 +1127,15 @@ class Top(QtWidgets.QWidget):
         self.tabs = QtWidgets.QTabWidget()
         self.detail_tab = QtWidgets.QWidget()
         self.image_tab = QtWidgets.QWidget()
-        self.help_tab = QtWidgets.QWidget()
         self.thumb_tab = QtWidgets.QScrollArea()
         self.thumb_tab.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.thumb_tab.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.aia_tab = QtWidgets.QWidget()
+        self.help_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.detail_tab,"Details")
-        self.tabs.addTab(self.image_tab,"Context Image")
+        self.tabs.addTab(self.image_tab,"Context Image (MSSL)")
         self.tabs.addTab(self.thumb_tab,"Intensity Maps")
+        self.tabs.addTab(self.aia_tab,"AIA Context")
         self.tabs.addTab(self.help_tab,"Help")
 
         # Create details tab
@@ -927,11 +1164,17 @@ class Top(QtWidgets.QWidget):
         # Create thumbnail images tab
         self.thumb_gallery = QtWidgets.QWidget()
         self.thumb_gallery.grid = QtWidgets.QGridLayout()
+        self.thumb_source_box = QtWidgets.QComboBox()
+        self.thumb_source_box.addItems(['MSSL', 'OSLO'])
+        self.thumb_source_box.setFixedWidth(self.thumb_imgNX)
+        self.thumb_source_box.setFont(self.default_font)
+        self.thumb_source_box.currentIndexChanged.connect(self.event_redraw_thumbs)
+        self.thumb_gallery.grid.addWidget(self.thumb_source_box, 0, 0)
         self.thumb_title = QtWidgets.QLabel(self)
         self.thumb_title.setFont(self.default_font)
-        self.thumb_title.setAlignment(QtCore.Qt.AlignCenter)
+        self.thumb_title.setAlignment(QtCore.Qt.AlignLeft)
         self.thumb_title.setText('Select a search result to view thumbnails')
-        self.thumb_gallery.grid.addWidget(self.thumb_title, 0, 0, 1, self.num_thumb_cols)
+        self.thumb_gallery.grid.addWidget(self.thumb_title, 0, 1, 1, (self.num_thumb_cols-1))
         self.blank_thumb = np.zeros((self.thumb_imgNX, self.thumb_imgNX, 3), dtype=np.int16)
         self.thumb_pixmap = [None]*25
         self.thumb_img_list = [None]*25
@@ -962,6 +1205,33 @@ class Top(QtWidgets.QWidget):
         self.thumb_gallery.setLayout(self.thumb_gallery.grid)
         self.thumb_tab.setWidget(self.thumb_gallery)
 
+        # Create AIA context tab
+        self.aia_ax = None
+        self.aia_tab.grid = QtWidgets.QGridLayout()
+        self.aia_wave_label = QtWidgets.QLabel(self)
+        self.aia_wave_label.setFont(self.default_font)
+        self.aia_wave_label.setText(u'AIA Channel [\u212B]')
+        self.aia_wave_label.setFixedWidth(140)
+        self.aia_wave_box = QtWidgets.QComboBox()
+        self.aia_wave_box.addItems(['94', '131', '171', '193', 
+                                    '211', '304', '335', '1600'])
+        self.aia_wave_box.setFixedWidth(66)
+        self.aia_wave_box.setFont(self.default_font)
+        self.aia_wave_box.setCurrentIndex(3) #default to 193
+        self.aia_wave_box.currentIndexChanged.connect(self.event_redraw_aia_context)
+        self.aia_title = QtWidgets.QLabel(self)
+        self.aia_title.setFont(self.default_font)
+        self.aia_title.setText('Select a search result to view AIA context')
+        self.aia_fig = Figure(figsize=(5, 5))
+        self.aia_canvas = FigureCanvas(self.aia_fig)
+        self.aia_nav = NavigationToolbar(self.aia_canvas, self)
+        self.aia_tab.grid.addWidget(self.aia_wave_label, 0, 0)
+        self.aia_tab.grid.addWidget(self.aia_wave_box, 0, 1)
+        self.aia_tab.grid.addWidget(self.aia_title, 0, 2)
+        self.aia_tab.grid.addWidget(self.aia_nav, 1, 0, 1, 3)
+        self.aia_tab.grid.addWidget(self.aia_canvas, 2, 0, 1, 3)
+        self.aia_tab.setLayout(self.aia_tab.grid)
+
         # Create help tab
         self.help_tab.grid = QtWidgets.QGridLayout()
         self.info_help = QtWidgets.QTextEdit()
@@ -974,7 +1244,7 @@ class Top(QtWidgets.QWidget):
         self.tabs.setStyleSheet('QTabBar{font-size: 11pt; font-family: Courier New;}')
         # self.grid.addWidget(self.tabs, 1, 6, self.gui_row + 1, 3)
         self.grid.addWidget(self.tabs, 0, 6, self.gui_row + 2, 3)
-        self.tabs.setCurrentIndex(3) # switch to help tab
+        self.tabs.setCurrentIndex(4) # switch to help tab
 
     def event_apply_filter(self):
         if self.count_results > 0:
@@ -1106,6 +1376,13 @@ class Top(QtWidgets.QWidget):
         """Close all figures, clean-up GUI objects, and quit the app"""
         if self.thumb_dialog is not None:
             self.thumb_dialog.close()
+
+        if self.aia_click is not None:
+            self.aia_fig.canvas.mpl_disconnect(self.aia_click)
+        self.aia_nav.close()
+        self.aia_canvas.close()
+        if os.path.isfile(self.aia_fits):
+            os.remove(self.aia_fits)
         QtWidgets.QApplication.instance().quit()
         self.close()
 
@@ -1118,6 +1395,7 @@ class ThumbDialog(QtWidgets.QDialog):
     def __init__(self, parent=None, iwin=0, old_geometry=None):
         super().__init__(parent)
 
+        self.iwin = iwin
         self.thumb_gallery = QtWidgets.QWidget()
         self.grid = QtWidgets.QGridLayout()
     
@@ -1147,8 +1425,8 @@ class ThumbDialog(QtWidgets.QDialog):
 
     def update_image(self, parent=None, iwin=0):
         """Update the thumbnail image"""
-        self.setWindowTitle(f"EIS Intensity Thumbnail from MSSL")
-        label_str = f"{parent.thumb_eis_file}   |   Window {iwin}" \
+        self.setWindowTitle(f"EIS Intensity Thumbnail from {parent.thumb_last_source}")
+        label_str = f"{parent.selected_file}   |   Window {iwin}" \
                    +f"   |   {parent.thumb_line_ids[iwin]}"
     
         pixmap = parent.thumb_pixmap[iwin]
@@ -1166,7 +1444,7 @@ class ThumbDialog(QtWidgets.QDialog):
 
         self.thumb_img.setPixmap(pixmap)
         self.thumb_label.setText(label_str)
-        
+        self.setFixedSize(self.grid.sizeHint())
 
     def clear_image(self, label_text=''):
         """Clear the thumnail image"""
@@ -1197,7 +1475,10 @@ def eis_catalog():
                             +'\nIf not given, will automatically search for the catalog')
 
     args = parser.parse_args()
-    app = QtWidgets.QApplication([])
+    app = QtWidgets.QApplication.instance()
+    if not app:
+        app = QtWidgets.QApplication([])
+    
     topthing = Top(args.cat_filepath)
 
     sys.exit(app.exec_())

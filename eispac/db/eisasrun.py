@@ -56,6 +56,9 @@ class EISAsRun():
         if input_cat_filepath is None:
             # IF still cannot find a valid catalog file, just exit
             self.cat_filepath = None
+            print("No EIS as-run database loaded. Please use eispac.db.download_db()"
+                 +" or the .update() method of the object returned by EISAsRun "
+                 +" to download a new copy to your home dir.")
             return None
         
         # Connect to the catalog file
@@ -136,11 +139,25 @@ class EISAsRun():
         self.skipped_obs = []
         self.unknown_main_row = {'stud_acr':'unknown', 'study_id':-999, 'jop_id':-999, 
                                  'obstitle':'NO STUDY INFO FOUND! ', 
-                                 'obs_dec':'No study info with same tl_id found within +-12 hrs ', 
+                                 'obs_dec':'No study info with same tl_id found within -24 to +12 hrs', 
                                  'sci_obj':'?? ', 'target':'unknown'}
         self.unknown_exp_row = {'filename':' ', 'date_obs':1, 'date_end':2, 
                                 'xcen':-90000, 'ycen':-90000, 'fovx':0.0, 'fovy':0.0, 
                                 'tl_id':0, 'rast_acr':'unknown', 'rast_id':1}
+        
+        # Check for the known 2022 ycen pointing issue after 2022-07-05T10:00
+        # Patch eqn (2024-Dec): ycen_fixed = ycen_bad - yws + 512.5
+        # NOTE 1: There _might_ also be an xcen issue BEFORE & AFTER this date,
+        #         but it is not clear how to patch it
+        # NOTE 2: The Level-1 HDF5 files are fine, as are the fits CRVAL2 keys
+        self.ycen_2022_issue_found = False
+        ycen_search = self.search(date=['2022-07-05T10:00', 1], study_id=494, quiet=True)
+        if ycen_search['ycen'][0] < -100:
+            self.ycen_2022_issue_found = True
+            self.ycen_2022_issue_fixed = True
+        else:
+            # If the issue is NOT found, then the as-run DB is already patched
+            self.ycen_2022_issue_fixed = True
 
     @property
     def eis_str(self):
@@ -187,8 +204,10 @@ class EISAsRun():
             self.cur.close()
             self.conn.close()
         else:
-            # Why are you updating when you don't even have a file loaded?
-            return None
+            # "Updating" while no DB is loaded will try to download a new copy
+            self.last_date_mod = '1999-09-09T09:09:09'
+            self.cat_filepath = pathlib.Path.home() / 'missing_eis_cat.placeholder'
+            force = True
         
         # Check current time and compare to last mod time
         # If time diff < 24 hours, there is probably NOT a new file to download
@@ -301,7 +320,7 @@ class EISAsRun():
                 t_end = loop_m_row['date_end'] + 43200 # 12 hr AFTER
                 exp_string = ('filename, date_obs, date_end, xcen, ycen,'
                              +' fovx, fovy, tl_id, rast_acr, rast_id,'
-                             +' xws, yws, saa, hlz')
+                             +' xws, yws, saa, hlz, tr_mode')
                 self.cur.execute('SELECT '+exp_string+' FROM'
                                 +' eis_experiment WHERE tl_id==?'
                                 +' AND date_obs BETWEEN ? and ?',
@@ -381,7 +400,7 @@ class EISAsRun():
                     m_row = loop_m_row
                 elif primary_db.lower().startswith('exp'):
                     # Search the MAIN DB for information
-                    t_start = e_row['date_obs'] - 43200 # 12 hr BEFORE
+                    t_start = e_row['date_obs'] - 2*43200 # 24 hr BEFORE
                     t_end = e_row['date_end'] + 43200 # 12 hr AFTER
                     main_string = ('stud_acr, study_id, jop_id, obstitle,'
                                     +' obs_dec, sci_obj, target')
@@ -400,7 +419,8 @@ class EISAsRun():
                 # self.results.append(EIS_Struct(e_row, ll_row, rast_row, m_row))
 
                 # NEW, create a list of dicts and copy to an astropy Table
-                self.results.append(_make_obs_dict(e_row, ll_row, rast_row, m_row))
+                self.results.append(_make_obs_dict(e_row, ll_row, rast_row, m_row, 
+                                        apply_ycen_2022_fix=self.ycen_2022_issue_found))
         
         if len(self.results) > 0:
             self.results = Table(rows=self.results)
@@ -411,6 +431,16 @@ class EISAsRun():
         """Retrieve info from any eis_cat.sqlite DB using multiple criteria.
         Will automatically identify which DB to search first.
         """
+        # Add "hop_id" as an alias of "jop_id", which is actually used in the DB
+        if 'hop_id' in kwargs.keys():
+            hop_vals = kwargs.pop('hop_id')
+            if 'jop_id' in kwargs.keys():
+                print('WARNING: Both "jop_id" and "hop_id" were input!'
+                     +' Using "jop_id" values and ignoring input "hop_id"')
+            else:
+                print('NOTICE: "hop_id" is an alias for the "jop_id" key in the'
+                     +" EIS as-run catalog (and the search results)")
+                kwargs['jop_id'] = hop_vals
 
         # Determine which DB to search first based on the first unique key found
         primary_db = 'eis_experiment' # Default search DB
@@ -428,7 +458,7 @@ class EISAsRun():
         if primary_db.lower().startswith('eis_exp'):
             select_cols = ('filename, date_obs, date_end, xcen, ycen,'
                           +' fovx, fovy, tl_id, rast_acr, rast_id,' 
-                          +' xws, yws, saa, hlz')
+                          +' xws, yws, saa, hlz, tr_mode')
             text_cols = ['rast_acr', 'll_acr']
             valid_cols = self.exp_cols
         elif primary_db.lower().startswith('eis_main'):
@@ -646,7 +676,7 @@ class EISAsRun():
         self.cur.execute(sql_string)
         self.mk_obs_list()
 
-def _make_obs_dict(exp_row, ll_row, rast_row, main_row):
+def _make_obs_dict(exp_row, ll_row, rast_row, main_row, apply_ycen_2022_fix=False):
     """Helper function for packing info about an EIS obs into a single dict
     """
     row = {}
@@ -664,6 +694,15 @@ def _make_obs_dict(exp_row, ll_row, rast_row, main_row):
     row['rast_acr'] = exp_row['rast_acr']
     row['rast_id'] = exp_row['rast_id']
 
+    # Fixing the known 2022 ycen pointing issue after 2022-07-05T10:00
+    # Patch eqn (2024-Dec): ycen_fixed = ycen_bad - yws + 512.5
+    # NOTE 1: There _might_ also be an xcen issue BEFORE & AFTER this date,
+    #         but it is not clear how to patch it
+    # NOTE 2: The Level-1 HDF5 files are fine, as are the fits CRVAL2 keys
+    if (apply_ycen_2022_fix and (row['date_obs'] > '2022-07-05T10:00:00')):
+        if row['yws'] > 0 and row['ycen'] > -9999:
+            row['ycen'] = row['ycen'] - row['yws'] + 512.5
+
     # Info from the main database
     row['stud_acr'] = main_row['stud_acr']
     row['study_id'] = main_row['study_id']
@@ -679,6 +718,7 @@ def _make_obs_dict(exp_row, ll_row, rast_row, main_row):
     row['saa'] = exp_row['saa'] if 'saa' in exp_row.keys() else 'N/A'
     # IN/OUT High Latitude Zone (auroral precipitation)
     row['hlz'] = exp_row['hlz'] if 'hlz' in exp_row.keys() else 'N/A'
+    row['tr_mode'] = exp_row['tr_mode'] if 'tr_mode' in exp_row.keys() else 'N/A'
 
     # Info from the raster database
     # row['acronym'] = rast_row['acronym'] # This is a duplicate of rast_acr!!!
