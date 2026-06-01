@@ -1475,10 +1475,24 @@ class MainWindow(QtWidgets.QWidget):
 
     def event_reset_plot(self):
         """Clear and replot a selected raster or spectrum"""
+        #TO-DO: make a function for clearing objects from the plot
         r_ind = int(self.sender().objectName()[1])
         plot_type = self.sender().objectName().split('_')[1]
 
         if plot_type.lower().startswith('rast'):
+            # If there is crosshair on the plot, remove it
+            if self.rast_crosshair[r_ind] is not None:
+                self.rast_crosshair[r_ind].remove()
+                self.rast_crosshair[r_ind] = None
+
+            # If there are any lines plotted on the ax, remove them
+            if self.rast_axhline[r_ind] is not None:
+                self.rast_axhline[r_ind].remove()
+                self.rast_axhline[r_ind] = None
+            if self.rast_axvline[r_ind] is not None:
+                self.rast_axvline[r_ind].remove()
+                self.rast_axvline[r_ind] = None
+
             self.rast_ax[r_ind] = None
             self.rast_fig[r_ind].clf()
             self.rast_lims[r_ind] = None
